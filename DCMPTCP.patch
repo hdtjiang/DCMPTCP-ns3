@@ -1,0 +1,2960 @@
+diff --git a/example.py b/example.py
+new file mode 100644
+index 0000000..4d158fe
+--- /dev/null
++++ b/example.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/python
++"""
++
++"""
++
++import sys
++import os
++
++#DCMPTCP
++tm="TYPICAL_INCAST"
++type="MPTCP"
++dctcp=0
++
++'''
++for cc in ["DCMPTCP", "RTT_Compensator", "XMP"]:
++  for fn in range(90, 101, 10):
++    for sf in [4, 8]:
++      work_dir="results/"+cc+'-'+str(sf)+'-dctcp-'+str(dctcp)+'-'+str(fn)
++      if not os.path.exists(work_dir):
++        os.makedirs(work_dir)
++      cmd="./waf --run \"scratch/example --cc="+cc+" --tm="+tm+" --fn="+str(fn)+" --hn="+str(fn+1)+" --socket="+type+" --sfs=128 --sf="\
++        +str(sf)+" --dctcp="+str(dctcp)+"\" --cwd "+str(work_dir)+" &"
++      os.system(cmd)
++'''
++
++#DCTCP
++
++cc="Uncoupled_TCPs"
++type="TCP"
++dctcp=1
++for fn in range(10, 101, 10):
++  work_dir="results/"+cc+'-'+str(1)+'-dctcp-'+str(dctcp)+'-'+str(fn)
++  if not os.path.exists(work_dir):
++    os.makedirs(work_dir)
++  cmd="./waf --run \"scratch/example --cc="+cc+" --tm="+tm+" --fn="+str(fn)+" --hn="+str(fn+1)+" --socket="+type+" --sfs=128 --sf="\
++    +str(1)+" --dctcp="+str(dctcp)+"\" --cwd "+str(work_dir)+" &"
++  os.system(cmd)
++  
++  
++
++
++
++
++
+diff --git a/scratch/example.cc b/scratch/example.cc
+new file mode 100644
+index 0000000..3dd0e28
+--- /dev/null
++++ b/scratch/example.cc
+@@ -0,0 +1,962 @@
++/*
++ * Author: Enhuan Dong - <deh13@mails.tsinghua.edu.cn>
++ */
++#include <ctime>
++#include <sys/time.h>
++#include <stdint.h>
++#include <fstream>
++#include <string>
++#include <cassert>
++#include <iostream>
++#include <iomanip>
++#include "ns3/log.h"
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/applications-module.h"
++#include "ns3/point-to-point-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/netanim-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/callback.h"
++#include "ns3/string.h"
++
++using namespace ns3;
++NS_LOG_COMPONENT_DEFINE("Example");
++
++typedef enum
++{
++  Spine, Leaf, Host, Spine_Leaf, Spine_Leaf_Host
++} Layers_t;
++
++typedef enum
++{
++  NONE, NEW_INCAST, TYPICAL_INCAST, NEW_INCAST_BK, ONE_MAP_ONE
++} TrafficMatrix_t;
++
++typedef enum
++{
++  TCP, MPTCP
++} SocketType_t;
++
++
++std::map<string, TrafficMatrix_t> stringToTrafficMatrix;
++std::map<string, SocketType_t> stringToSocketType;
++vector<ApplicationContainer> sourceShortFlowApps;
++vector<ApplicationContainer> sourceLargeFlowApps;
++vector<ApplicationContainer> sinkApps;
++
++#define PORT 5000
++
++// Setup general parameters
++string g_topology = "Example";
++string g_simName  = "MPTCP_Incast";
++
++
++// Setup topology parameters
++string g_downLinkCapacity = "10Gbps";  
++string g_upLinkCapacity = "40Gbps";  //Normal
++string g_linkDelay = "25us";       
++
++uint32_t g_numSpine = 4;
++uint32_t g_numLeaf = 8;
++uint32_t g_numHost = 32;
++
++uint32_t g_flowSize = 128000;   // 128KB
++uint32_t g_simTime = 30;             // 20 Seconds (default)
++uint32_t g_seed = 0;                // RNG seed
++SocketType_t g_socketType = MPTCP;
++TrafficMatrix_t g_trafficMatrix = NEW_INCAST;
++
++string g_simInstance = "0";
++string g_simStartTime = "NULL";
++uint32_t g_minRTO = 200;
++double g_flowStartTime = 0.0;
++
++uint32_t g_rGap = 50;
++// Setup MPTCP parameters
++string g_cc = "RTT_Compensator"; // Uncoupled_TCPs, Linked_Increases, Fully_Coupled, RTT_Compensator
++uint32_t g_subflows = 8;
++uint32_t g_initialCWND = 10;
++uint32_t g_slaveIW = 1;
++bool g_enableDCTCP = true;
++
++// For dctcp only
++double g_downLinkREDmaxTh = 65;
++double g_downLinkREDminTh = 65;
++ 
++uint32_t g_downLinkREDQueueLimit = 350;   
++
++ // Normal
++double g_upLinkREDmaxTh = 150;
++double g_upLinkREDminTh = 150;
++uint32_t g_upLinkREDQueueLimit = 1400;   
++
++uint32_t g_segmentSize = 1400;
++uint32_t g_REDMeanPktSize = g_segmentSize;
++
++
++// [Second][Metrics][Node][Dev]
++/*
++double spine_data[g_simTime + 5][2][g_numLeaf * g_numHost][64];
++double leaf_data [g_simTime + 5][2][g_numLeaf * g_numHost][64];
++double host_data[g_simTime + 5][2][g_numLeaf * g_numHost][2];
++*/
++// These arrays should have larger space than the previous annotated ones.
++double spine_data[60][2][256][64];
++double leaf_data[60][2][256][64];
++double host_data[60][2][256][2];
++
++double totalSpineUtil, totalSpineLoss, totalLeafUtil, totalLeafLoss, totalHostUtil, totalHostLoss = 0.0;
++double meanSpineUtil, meanSpineLoss, meanLeafUtil, meanLeafLoss, meanHostUtil, meanHostLoss = 0.0;
++
++// NodeContainer to use for link utilization and loss rate
++NodeContainer spine_c;
++NodeContainer leaf_c;
++NodeContainer host_c;
++
++//Incast
++uint32_t g_numFlow = 10;
++
++void SimHeaderWritter(Ptr<OutputStreamWrapper> stream);
++void SimFooterWritter(Ptr<OutputStreamWrapper> stream);
++
++uint64_t
++GetLinkRate(string linkRate)
++{
++  DataRate tmp(linkRate);
++  return tmp.GetBitRate();
++}
++
++void
++SetupStringToTM()
++{
++  stringToTrafficMatrix["TYPICAL_INCAST"] = TYPICAL_INCAST;
++  stringToTrafficMatrix["NONE"] = NONE;
++}
++
++void
++SetupStringToST()
++{
++  stringToSocketType["TCP"] = TCP;
++  stringToSocketType["MPTCP"] = MPTCP;
++}
++
++
++string
++GetKeyFromValueTM(TrafficMatrix_t tm)
++{
++  map<string, TrafficMatrix_t>::const_iterator it = stringToTrafficMatrix.begin();
++  for (; it != stringToTrafficMatrix.end(); it++)
++    {
++      if (it->second == tm)
++        return it->first;
++    }
++  return "";
++}
++
++string
++GetKeyFromValueST(SocketType_t st)
++{
++  map<string, SocketType_t>::const_iterator it = stringToSocketType.begin();
++  for (; it != stringToSocketType.end(); it++)
++    {
++      if (it->second == st)
++        return it->first;
++    }
++  return "";
++}
++
++string
++SetupSimFileName(string input)
++{
++  ostringstream oss;
++  oss.str("");
++  oss << g_simName << "_" << g_topology  <<  "_MPTCP_" << GetKeyFromValueTM(g_trafficMatrix) << "_" << input << "_" << g_simInstance
++      << ".data";
++  string tmp = oss.str();
++  oss.str("");
++  return tmp;
++}
++
++void
++OutPutSpine()
++{
++  Ptr<OutputStreamWrapper> stream = Create<OutputStreamWrapper>(SetupSimFileName("Spine"), std::ios::out);
++  ostream *os = stream->GetStream();
++  for (uint32_t s = 0; s <= g_simTime; s++)                          // [Seconds]
++    {
++      *os << s;
++      for (uint32_t m = 0; m < 2; m++)                               // [Metrics]
++        {
++          for (uint32_t n = 0; n < spine_c.GetN(); n++)               // [Node]
++            {
++              for (uint32_t d = 1; d <= g_numLeaf; d++)                    // [Dev]
++                {
++
++                  if (s == 0)
++                    *os << " " << "Node" << n <<"Link" << d << "Metric"<<m;
++                  else
++                    {
++                      *os << "    " << spine_data[s][m][n][d];
++                      if (m == 0)            // Utilization
++                        totalSpineUtil += spine_data[s][m][n][d];
++                      else if (m == 1)       // Loss" " << "Node" << n <<"Link" << d << "Metric"<<m;
++                        totalSpineLoss += spine_data[s][m][n][d];
++                    }
++                }
++            }
++        }
++      *os << endl;
++    }
++}
++
++
++void
++OutPutLeaf()
++{
++  Ptr<OutputStreamWrapper> stream_leaf = Create<OutputStreamWrapper>(SetupSimFileName("LEAF"), std::ios::out);
++  ostream *os_leaf = stream_leaf->GetStream();
++  for (uint32_t s = 0; s <= g_simTime; s++)                           // [Seconds]
++    {
++      *os_leaf << s;
++      for (uint32_t m = 0; m < 2; m++)                                // [Metrics]
++        {
++          for (uint32_t n = 0; n < leaf_c.GetN(); n++)                 // [Node]
++            {
++              for (uint32_t d = 1; d <= g_numSpine + g_numHost; d++)                     // [Dev]
++                {
++                  if (s == 0)
++                    *os_leaf << " " << "Node" << n <<"Link" << d << "Metric"<<m;
++                  else
++                    {
++                      *os_leaf << "    " << leaf_data[s][m][n][d];
++                      if (m == 0)            // leaf Utilization
++                        totalLeafUtil += leaf_data[s][m][n][d];
++                      else if (m == 1)       // Leaf Loss
++                        totalLeafLoss += leaf_data[s][m][n][d];
++                    }
++                }
++            }
++        }
++      *os_leaf << endl;
++    }
++}
++
++void
++OutPutHost(){
++  Ptr<OutputStreamWrapper> stream_host = Create<OutputStreamWrapper>(SetupSimFileName("HOST"), std::ios::out);
++    ostream *os_host = stream_host->GetStream();
++    for (uint32_t s = 0; s <= g_simTime; s++)                   // [Seconds]
++      {
++        *os_host << s;
++        for (uint32_t m = 0; m < 2; m++)                        // [Metrics]
++          {
++            for (uint32_t n = 0; n < host_c.GetN(); n++)        // [Node]
++              {
++                for (uint32_t d = 1; d <= 1; d++)               // [Dev]
++                  {
++                    if (s == 0)
++                      *os_host << " " << "Node" << n <<"Link" << d << "Metric"<<m;
++                    else
++                      {
++                        *os_host << "    " << host_data[s][m][n][d];
++                        if (m == 0)       // host Utilization
++                          totalHostUtil += host_data[s][m][n][d];
++                        else if (m == 1)  // host Loss
++                          totalHostLoss += host_data[s][m][n][d];
++                      }
++                  }
++              }
++          }
++        *os_host << endl;
++      }
++}
++
++void
++PrintSimParams()
++{
++  cout << endl;
++  cout << "Socket Type      : " << GetKeyFromValueST(g_socketType).c_str() << endl;
++  cout << "Traffic Matrix   : " << GetKeyFromValueTM(g_trafficMatrix).c_str() << endl;
++  cout << "Seed             : " << g_seed << endl;
++  cout << "Instance         : " << g_simInstance << endl;
++  cout << "DCTCP            : " << g_enableDCTCP << endl;
++  cout << "CC               : " << g_cc << endl;
++  //cout << "Incast Number    : " << g_incastNumber << endl;
++}
++
++void
++SimTimeMonitor()
++{
++  NS_LOG_UNCOND("ClockTime: " << Simulator::Now().GetSeconds());
++  double now = Simulator::Now().GetSeconds();
++  cout << "[" << g_simName << "](" << g_topology << ")[" << GetKeyFromValueST(g_socketType) << "]{"
++      << GetKeyFromValueTM(g_trafficMatrix)
++      << "} -> SimClock: " << now << endl;
++  if (now < g_simTime)
++    Simulator::Schedule(Seconds(0.1), &SimTimeMonitor);
++}
++
++
++Ptr<Queue>
++FindQueue(Ptr<NetDevice> dev)
++{
++  PointerValue ptr;
++  dev->GetAttribute("TxQueue", ptr);
++  return ptr.Get<Queue>();
++}
++
++
++// [Second][Node][Dev][Metrics]
++void
++SetupTraces(const Layers_t &layer)
++{
++  uint32_t T = (uint32_t) Simulator::Now().GetSeconds();
++  if (layer == Spine || layer >= Spine_Leaf)
++    {
++      for (uint32_t i = 0; i < spine_c.GetN(); i++)
++        { // j should 1 as lookback interface should not be counted
++          for (uint32_t j = 1; j < spine_c.Get(i)->GetNDevices(); j++)
++            {
++              Ptr<Queue> txQueue = FindQueue(spine_c.Get(i)->GetDevice(j));
++              uint32_t totalDropBytes = txQueue->GetTotalDroppedBytes();
++              uint32_t totalRxBytes = txQueue->GetTotalReceivedBytes();
++              uint32_t totalBytes = totalRxBytes + totalDropBytes;
++              spine_data[T][0][i][j] = (((double) totalRxBytes * 8 * 100) / GetLinkRate(g_upLinkCapacity)); // Link Utilization
++              spine_data[T][1][i][j] = (((double) totalDropBytes * 1.0 / totalBytes) * 100); // LossRate
++              
++              if (totalDropBytes)
++                NS_LOG_INFO ("Loss!!!");
++              NS_LOG_INFO ("spine packet loss:" << T << " spine:" << i << " NIC:" << j << " " << totalDropBytes * 1.0 / 1400 << " " << totalBytes * 1.0 / 1400);
++
++              // Make sure util is not nan
++              if (isNaN(spine_data[T][0][i][j]))
++                spine_data[T][0][i][j] = 0;
++              // Make sure loss is not nan
++              if (isNaN(spine_data[T][1][i][j]))
++                spine_data[T][1][i][j] = 0;
++              // Reset txQueue
++              txQueue->ResetStatistics();
++            }
++        }
++    }
++
++  if (layer == Leaf || layer >= Spine_Leaf)
++    {
++      for (uint32_t i = 0; i < leaf_c.GetN(); i++)
++        { // dev = 1 as loop back interface should not be counted here.
++          for (uint32_t j = 1; j < leaf_c.Get(i)->GetNDevices(); j++)
++            {
++              Ptr<Queue> txQueue = FindQueue(leaf_c.Get(i)->GetDevice(j));
++              uint32_t totalDropBytes = txQueue->GetTotalDroppedBytes();
++              uint32_t totalRxBytes = txQueue->GetTotalReceivedBytes();
++              uint32_t totalBytes = totalRxBytes + totalDropBytes;
++              if (j <= g_numHost)
++                leaf_data[T][0][i][j] = (((double) totalRxBytes * 8 * 100) / GetLinkRate(g_downLinkCapacity));
++              else
++                leaf_data[T][0][i][j] = (((double) totalRxBytes * 8 * 100) / GetLinkRate(g_upLinkCapacity));
++
++              leaf_data[T][1][i][j] = (((double) totalDropBytes * 1.0 / totalBytes) * 100);
++              if (totalDropBytes)
++                NS_LOG_INFO ("Loss!!!");
++              NS_LOG_INFO ("leaf packet loss:" << T << " leaf:" << i << " NIC:" << j << " " << totalDropBytes * 1.0 / 1400 << " " << totalBytes * 1.0 / 1400);
++
++              // Make sure leaf util is not nan
++              if (isNaN(leaf_data[T][0][i][j]))
++                leaf_data[T][0][i][j] = 0;
++              // Make sure leaf loss is not nan
++              if (isNaN(leaf_data[T][1][i][j]))
++                leaf_data[T][1][i][j] = 0;
++              txQueue->ResetStatistics();
++            }
++        }
++    }
++  if (layer == Host || layer >= Spine_Leaf_Host)
++    {
++      for (uint32_t i = 0; i < host_c.GetN(); i++)
++        { // dev = 1 as loop back interface should not be counted here.
++          for (uint32_t j = 1; j < host_c.Get(i)->GetNDevices(); j++)
++            {
++              Ptr<Queue> txQueue = FindQueue(host_c.Get(i)->GetDevice(j));
++              uint32_t totalDropBytes = txQueue->GetTotalDroppedBytes();
++              uint32_t totalRxBytes = txQueue->GetTotalReceivedBytes();
++              uint32_t totalBytes = totalRxBytes + totalDropBytes;
++              double util = (((double) totalRxBytes * 8 * 100) / GetLinkRate(g_downLinkCapacity));
++              double loss = (((double) totalDropBytes * 1.0 / totalBytes) * 100);
++              if (totalDropBytes)
++                NS_LOG_INFO ("Loss!!!");
++              NS_LOG_INFO ("host packet loss:" << T << " host:" << i << " NIC:" << j << " " << totalDropBytes * 1.0 / 1400 << " " << totalBytes * 1.0 / 1400);
++              
++              if (isNaN(util))
++                util = 0;
++              if (isNaN(loss))
++                loss = 0;
++              host_data[T][0][i][j] = util;
++              host_data[T][1][i][j] = loss;
++
++              txQueue->ResetStatistics();
++            }
++        }
++    }
++  if (T < g_simTime)
++    Simulator::Schedule(Seconds(1), &SetupTraces, layer);
++}
++
++string
++GetDateTimeNow()
++{
++  time_t T = time(0);
++  struct tm* now = localtime(&T);
++  string simStartDate = asctime(now);
++  return simStartDate.substr(0, 24);
++}
++
++void
++SetSimStartTime()
++{
++  g_simStartTime = GetDateTimeNow();
++}
++
++string
++GetSimStartTime()
++{
++  return g_simStartTime;
++}
++
++void
++SimHeaderWritter(Ptr<OutputStreamWrapper> stream)
++{
++  ostream *os = stream->GetStream ();
++  *os << "SimStart [" << g_simStartTime << "] simName[" << g_simName
++      << "] Topology[" << g_topology 
++      << "] SocketType[" << GetKeyFromValueST (g_socketType) 
++      << "] TrafficMatrix[" << GetKeyFromValueTM (g_trafficMatrix)
++      << "] Seed[" << g_seed << "] simInstance["
++      << g_simInstance << "] SimPeriod[" << g_simTime
++      << "s] HostPerLeaf[" << g_numHost << "] CC[" << g_cc << "] dctcp[" << g_enableDCTCP
++      << "] ShortFlowSize[" << g_flowSize <<"] SubflowNum[" <<g_subflows
++      << "] upLinkRate["<< g_upLinkCapacity << "] downLinkRate["<< g_downLinkCapacity << "] LinkDelay[" << g_linkDelay
++      << "] RTOmin[ " << g_minRTO << "]" << endl;
++}
++
++void
++SimFooterWritter(Ptr<OutputStreamWrapper> stream)
++{
++  ostream *os = stream->GetStream();
++  *os << "SimEnd [" << GetDateTimeNow() << "] AllFlows[" << sourceLargeFlowApps.size() + sourceShortFlowApps.size()
++      << "] LargeFlow[" << sourceLargeFlowApps.size() << "] ShortFlows[" << sourceShortFlowApps.size() << "]  SpineUtil["
++      << meanSpineUtil << "] SpineLoss[" << meanSpineLoss << "]"
++      << endl;
++}
++
++void
++SimOverallResultWritter()
++{
++  Ptr<OutputStreamWrapper> stream = Create<OutputStreamWrapper>(SetupSimFileName("OVERALL"), std::ios::out | std::ios::app);
++  SimHeaderWritter(stream);
++  ostream *os = stream->GetStream();
++  meanSpineUtil = totalSpineUtil / (g_simTime * g_numSpine);
++  meanSpineLoss = totalSpineLoss / (g_simTime * g_numSpine);
++  if (isNaN(meanSpineUtil))
++    meanSpineUtil = 0;
++  if (isNaN(meanSpineLoss))
++    meanSpineLoss = 0;
++  meanLeafUtil = totalLeafUtil / (g_simTime * g_numLeaf);
++  meanLeafLoss = totalLeafLoss / (g_simTime * g_numLeaf);
++  if (isNaN(meanLeafUtil))
++    meanLeafUtil = 0;
++  if (isNaN(meanLeafLoss))
++    meanLeafLoss = 0;
++  meanHostUtil = totalHostUtil / (g_simTime * g_numHost);
++  meanHostLoss = totalHostLoss / (g_simTime * g_numHost);
++  if (isNaN(meanHostUtil))
++    meanHostUtil = 0;
++  if (isNaN(meanHostLoss))
++    meanHostLoss = 0;
++  *os << "SpineUtil [!" << meanSpineUtil << "!]\nSpineLoss [@" << meanSpineLoss 
++      << "$]\nLeafUtil [%" << meanLeafUtil << "%]\nLeafLoss [^" << meanLeafLoss
++      << "^]\nHostUtil [&" << meanHostUtil << "&]\nHostLoss [*" << meanHostLoss << "*]" << endl;
++  SimFooterWritter(stream);
++}
++
++void
++SimResultHeaderGenerator()
++{
++  Ptr<OutputStreamWrapper> streamSimParam = Create<OutputStreamWrapper>(SetupSimFileName("RESULT"),
++      std::ios::out | std::ios::app);
++  SimHeaderWritter(streamSimParam);
++}
++
++void
++SimResultFooterGenerator()
++{
++  Ptr<OutputStreamWrapper> streamSimParam = Create<OutputStreamWrapper>(SetupSimFileName("RESULT"),
++      std::ios::out | std::ios::app);
++  SimFooterWritter(streamSimParam);
++}
++
++bool
++SetNumSubflow(std::string input)
++{
++  cout << "Subflows         : " << g_subflows << " -> " << input << endl;
++  g_subflows = atoi(input.c_str());
++  return true;
++}
++
++bool
++SetCongestionControl(std::string input)
++{
++  cout << "CongestionControl: " << g_cc << " -> " << input << endl;
++  g_cc = input;
++  return true;
++}
++
++bool
++SetShortFlowSize(std::string input)
++{
++  g_flowSize = atoi(input.c_str()) * 1000;
++  cout << "FlowSize    : " << g_flowSize << endl;
++  return true;
++}
++
++bool
++SetSimTime(std::string input)
++{
++  cout << "SimDuration      : " << g_simTime << " -> " << input << endl;
++  g_simTime = atoi(input.c_str());
++  return true;
++}
++
++bool
++SetTrafficMatrix(std::string input)
++{
++  cout << "TrafficMatrix    : " << GetKeyFromValueTM(g_trafficMatrix) << " -> " << input << endl;
++  if (stringToTrafficMatrix.count(input) != 0)
++    {
++      g_trafficMatrix = stringToTrafficMatrix[input];
++    }
++  else
++    NS_FATAL_ERROR("Input for setting up traffic matrix has spelling issue - try again!");
++  return true;
++}
++
++bool
++SetSocketType(std::string input)
++{
++  cout << "SocketType       : " << GetKeyFromValueST(g_socketType) << " -> " << input << endl;
++  if (stringToSocketType.count(input) != 0)
++    {
++      g_socketType = stringToSocketType[input];
++    }
++  else
++    NS_FATAL_ERROR("Input for setting up socket type has spelling issue - try again!");
++  return true;
++}
++
++bool
++SetSimInstance(std::string input)
++{
++  cout << "SimInstance      : " << g_simInstance << " -> " << input << endl;
++  g_simInstance = input;
++  return true;
++}
++
++bool
++SetRTO(std::string input)
++{
++  cout << "RTO              : " << g_minRTO << " -> " << input << endl;
++  g_minRTO = atoi(input.c_str());
++  return true;
++}
++
++bool
++SetSimName(std::string input)
++{
++  cout << "SimName          : " << g_simName << " -> " << input << endl;
++  g_simName = input;
++  return true;
++}
++
++bool
++SetIW(std::string input)
++{
++  cout << "InitalCWND       : " << g_initialCWND << " -> " << input << endl;
++  g_initialCWND = atoi(input.c_str());
++  return true;
++}
++
++bool
++SetSlaveIW(std::string input)
++{
++  cout << "InitalSlaveCWND       : " << g_slaveIW << " -> " << input << endl;
++  g_slaveIW = atoi(input.c_str());
++  return true;
++}
++
++
++
++bool
++SetFST(std::string input)
++{
++  cout << "SetFST          : " << g_flowStartTime << " -> " << input << endl;
++  g_flowStartTime = atof(input.c_str());
++  return true;
++}
++
++bool
++SetHostNumber(std::string input){
++  cout << "Host Number    : " << g_numHost << " -> " << input << endl;
++  g_numHost = atoi(input.c_str());
++  return true;
++}
++
++bool
++SetFlowNumber(std::string input){
++  cout << "Flow Number    : " << g_numFlow << " -> " << input << endl;
++  g_numFlow = atoi(input.c_str());
++  return true;
++}
++
++void printNodeAddr(Ptr<Node> tmp)
++{
++  Ptr<Ipv4> ipv4Src = tmp->GetObject<Ipv4>();
++  Ipv4InterfaceAddress ipv4InterfaceAddressSrc = ipv4Src->GetAddress(1, 0);
++  Ipv4Address ipv4AddressSrc = ipv4InterfaceAddressSrc.GetLocal();
++  ipv4AddressSrc.Print(cout);
++  cout << endl;
++}
++
++
++bool
++SetDCTCP (std::string input)
++{
++  cout << "Enable DCTCP     : " << g_enableDCTCP << " -> " << input << endl;
++  g_enableDCTCP = atoi (input.c_str ());
++  return true;
++}
++
++
++
++void
++FlowConfigForTypicalIncast(const NodeContainer *host)
++{
++  // dst setup
++  Ptr<Node> dstNode = host[0].Get(g_numFlow);
++  Ptr<Ipv4> ipv4Dst = dstNode->GetObject<Ipv4>();
++  Ipv4InterfaceAddress ipv4InterfaceAddressDst = ipv4Dst->GetAddress(1, 0);
++  Ipv4Address ipv4AddressDst = ipv4InterfaceAddressDst.GetLocal();
++  cout << "DST:";
++  ipv4AddressDst.Print(cout);
++  cout << endl;
++    
++  for (uint32_t j = 0; j < g_numFlow; j++)
++    {
++      Ptr<Node> srcNode = host[0].Get(j);
++      Ptr<Ipv4> ipv4Src = srcNode->GetObject<Ipv4>();
++      Ipv4InterfaceAddress ipv4InterfaceAddressSrc = ipv4Src->GetAddress(1, 0);
++      Ipv4Address ipv4AddressSrc = ipv4InterfaceAddressSrc.GetLocal();
++
++      cout << "SRC:";
++      ipv4AddressSrc.Print(cout);
++      cout << endl;
++
++      // Assign flowId
++      int flowId = srcNode->GetNApplications();
++
++      // Source
++      MpTcpBulkSendHelper source("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address(ipv4AddressDst), PORT));
++      source.SetAttribute("MaxBytes", UintegerValue(g_flowSize));
++      source.SetAttribute("FlowId", UintegerValue(flowId));
++      //source.SetAttribute("MaxSubflows", UintegerValue(g_subflows));
++      source.SetAttribute("FlowType", StringValue("Short"));
++      string tempString = SetupSimFileName("RESULT");
++      source.SetAttribute("OutputFileName", StringValue(tempString));
++
++      ApplicationContainer sourceApps = source.Install(srcNode);
++      //sourceApps.Start (Seconds (i * g_flowgap));
++      sourceApps.Start (Seconds(0.0));
++      sourceApps.Stop (Seconds(g_simTime));
++
++      sourceShortFlowApps.push_back(sourceApps);
++      cout << "[" << GetKeyFromValueST(g_socketType) << "]{" << GetKeyFromValueTM(g_trafficMatrix) << "} StartNow: "
++                    << Simulator::Now().GetSeconds() << " No." << j << endl;
++    }
++}
++
++
++
++
++
++// Main
++int
++main(int argc, char *argv[])
++{
++  SetupStringToTM(); // Should be done before cmd parsing
++  SetupStringToST();
++  SetSimStartTime();
++
++  // Enable log components
++  LogComponentEnable("Example", LOG_ALL);
++  /*LogComponentEnable("MpTcpSocketBase", LOG_LEVEL_INFO);
++
++  LogComponentEnable("Ipv4L3Protocol", LOG_LEVEL_INFO);
++  LogComponentEnable("StoneACL", LOG_ALL);
++  LogComponentEnable("TraccACL", LOG_ALL);
++  LogComponentEnable("StoneACLHelper", LOG_ALL);
++  LogComponentEnable("TraccACLHelper", LOG_ALL);*/
++
++  // Set up command line parameters
++  CommandLine cmd;
++  cmd.AddValue("sf", "Number of MPTCP SubFlows", MakeCallback(SetNumSubflow));
++  cmd.AddValue("cc", "MPTCP Congestion Control algorithm", MakeCallback(SetCongestionControl));
++  cmd.AddValue("sfs", "Short Flow Size", MakeCallback(SetShortFlowSize));
++  cmd.AddValue("st", "Simulation Time", MakeCallback(SetSimTime));
++  cmd.AddValue("tm", "Set traffic matrix", MakeCallback(SetTrafficMatrix));
++  cmd.AddValue("socket", "Set socket type ", MakeCallback(SetSocketType));
++  cmd.AddValue("i", "Set simulation instance number as a string", MakeCallback(SetSimInstance));
++  cmd.AddValue("rto", "Set minRTO", MakeCallback(SetRTO));
++  cmd.AddValue("sim", "Set sim name", MakeCallback(SetSimName));
++  cmd.AddValue("iw", "Set initial cwnd of initial subflow of MPTCP", MakeCallback(SetIW));
++  cmd.AddValue("siw","DCMPTCP slave initial window", MakeCallback(SetSlaveIW));
++  cmd.AddValue("hn", "Number of hosts in Incast scenrio", MakeCallback(SetHostNumber));
++  
++  
++  cmd.AddValue ("dctcp", "Enable DCTCP Capability", MakeCallback (SetDCTCP));
++  
++  cmd.AddValue("fn", "Number of flows in Incast scenrio", MakeCallback(SetFlowNumber));
++  
++
++  cmd.Parse(argc, argv);
++
++  // Set up default simulation parameters
++  Config::SetDefault("ns3::Ipv4GlobalRouting::FlowEcmpRouting", BooleanValue(true));
++  Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(g_segmentSize));
++  Config::SetDefault("ns3::DropTailQueue::Mode", StringValue("QUEUE_MODE_PACKETS"));
++  Config::SetDefault("ns3::MpTcpSocketBase::RandomGap", UintegerValue(g_rGap));
++
++
++  switch (g_socketType)
++    {
++    case MPTCP:
++      Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(MpTcpSocketBase::GetTypeId()));
++      Config::SetDefault("ns3::MpTcpSocketBase::CongestionControl", StringValue(g_cc));
++      Config::SetDefault("ns3::MpTcpBulkSendApplication::CongestionControl", StringValue(g_cc));
++      Config::SetDefault("ns3::MpTcpSocketBase::MaxSubflows", UintegerValue(g_subflows)); // Sink
++      Config::SetDefault("ns3::MpTcpBulkSendApplication::MaxSubflows", UintegerValue((uint8_t)g_subflows));//Source
++      Config::SetDefault("ns3::MpTcpSocketBase::PathManagement", StringValue("NdiffPorts"));
++      Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(g_initialCWND));
++      Config::SetDefault("ns3::MpTcpSocketBase::SlaveIW", UintegerValue(g_slaveIW));
++      //Config::SetDefault("ns3::MpTcpSocketBase::LargePlotting", BooleanValue(true));
++      //Config::SetDefault("ns3::MpTcpSocketBase::ShortPlotting", BooleanValue(true));
++      
++      if (g_cc == "DCMPTCP") 
++        Config::SetDefault("ns3::MpTcpSocketBase::SchedulingAlgorithm", StringValue("DC_SCHE"));
++
++      break;
++    case TCP:
++      Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(MpTcpSocketBase::GetTypeId()));
++      Config::SetDefault("ns3::MpTcpSocketBase::MaxSubflows", UintegerValue(1)); // For the sink
++      Config::SetDefault("ns3::MpTcpBulkSendApplication::MaxSubflows", UintegerValue(1)); // TCP need one subflow only
++      Config::SetDefault("ns3::MpTcpSocketBase::CongestionControl", StringValue("Uncoupled_TCPs"));
++      Config::SetDefault("ns3::MpTcpBulkSendApplication::CongestionControl", StringValue("Uncoupled_TCPs"));
++      Config::SetDefault("ns3::MpTcpSocketBase::PathManagement", StringValue("NdiffPorts"));
++      Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(g_initialCWND));
++      break;
++    default:
++      break;
++    }
++
++  if (g_enableDCTCP)
++    {
++      Config::SetDefault("ns3::MpTcpSocketBase::CongestionControl", StringValue("Uncoupled_TCPs"));
++      Config::SetDefault ("ns3::MpTcpSocketBase::DCTCP", BooleanValue (g_enableDCTCP));
++      Config::SetDefault ("ns3::MpTcpBulkSendApplication::DCTCP", BooleanValue (g_enableDCTCP)); // Source Control
++      Config::SetDefault ("ns3::MpTcpSocketBase::DCTCPWeight", DoubleValue (1.0 / 16.0));
++    }
++  Config::SetDefault ("ns3::RedQueue::UseCurrent", BooleanValue (true));
++
++  Config::SetDefault ("ns3::RedQueue::Mode", StringValue ("QUEUE_MODE_PACKETS"));
++  Config::SetDefault ("ns3::RedQueue::MeanPktSize", UintegerValue (g_REDMeanPktSize));
++  Config::SetDefault ("ns3::RedQueue::Wait", BooleanValue (true));
++  Config::SetDefault ("ns3::RedQueue::Gentle", BooleanValue (false));
++  Config::SetDefault ("ns3::RedQueue::QW", DoubleValue (1.0));
++  
++    
++  //Config::SetDefault ("ns3::TraccACL::TimeInterval", TimeValue (MicroSeconds (100)));
++    
++  g_seed = static_cast<uint32_t>(atoi(g_simInstance.c_str()));
++  cout << "Seed             : " << g_seed << endl;
++  srand(g_seed);
++
++  SimResultHeaderGenerator();
++
++  cout << endl;
++  cout << "Node num:" 
++  << " g_numSpine:" << g_numSpine 
++  << " g_numHost:" << g_numHost 
++  << " g_numLeaf:" << g_numLeaf << endl;
++
++
++  PrintSimParams();
++
++  InternetStackHelper internet;
++
++// ------------------ Topology Construction ------------------
++  NodeContainer allHosts;
++
++// Host Layer Nodes
++  NodeContainer host[g_numLeaf]; // NodeContainer for hosts
++
++  for (uint32_t j = 0; j < g_numLeaf; j++)
++    { // host[g_numLeaf]
++      host[j].Create(g_numHost); 
++      internet.Install(host[j]);
++      allHosts.Add(host[j]);     // Add all server to GlobalHostContainer
++      host_c.Add(host[j]);       // Add all server to Host_c for link utilization
++    }
++
++// Access layer Nodes
++  NodeContainer leaf;          // NodeContainer for leaf switches
++  leaf.Create(g_numLeaf);
++  internet.Install(leaf);
++  leaf_c.Add(leaf);
++
++// Core Layer Nodes
++  NodeContainer spine;       // NodeContainer for core switches
++  spine.Create(g_numSpine);
++  internet.Install(spine);
++  spine_c.Add(spine);
++// -----------------------------------------------------------
++  PointToPointHelper p2p;
++  if (g_enableDCTCP )//|| (g_cc == "XMP")
++  {
++    p2p.SetQueue ("ns3::RedQueue", 
++                  "LinkBandwidth", StringValue (g_downLinkCapacity), 
++                  "LinkDelay", StringValue (g_linkDelay),
++                  "MinTh", DoubleValue (g_downLinkREDminTh),
++                  "MaxTh", DoubleValue (g_downLinkREDmaxTh),
++                  "QueueLimit", UintegerValue (g_downLinkREDQueueLimit));
++  }
++  else
++  {//DCMPTCP and MPTCP
++    p2p.SetQueue ("ns3::DropTailQueue",
++                "MaxPackets", UintegerValue (g_downLinkREDQueueLimit));
++  }
++  p2p.SetDeviceAttribute ("DataRate", StringValue (g_downLinkCapacity));
++  p2p.SetChannelAttribute ("Delay", StringValue (g_linkDelay));
++  
++
++  Ipv4AddressHelper ipv4Address;
++  StoneACLHelper stoneACL;
++  TraccACLHelper traccACL;
++
++//=========== Connect hosts to leafs ===========//
++  NetDeviceContainer hostToLeafNetDevice[g_numLeaf][g_numHost];
++  stringstream ss;
++
++  for (uint32_t t = 0; t < g_numLeaf; t++)
++    {
++      ss.str("");
++      ss << "10." << t << ".0." << "0";
++      string tmp = ss.str();
++      const char* address = tmp.c_str();
++      ipv4Address.SetBase(address, "255.255.255.0");
++      
++      if (g_cc == "DCMPTCP") 
++      {
++        stoneACL.Install (leaf.Get(t), Ipv4Address (address), g_numHost);
++        traccACL.Install (leaf.Get(t), g_numLeaf, g_numHost, g_numSpine, Ipv4Address (address));
++      }
++      for (uint32_t h = 0; h < g_numHost; h++)
++        {
++          hostToLeafNetDevice[t][h] = p2p.Install(NodeContainer(host[t].Get(h), leaf.Get(t)));
++          ipv4Address.Assign(hostToLeafNetDevice[t][h]);
++          Ipv4Address newNet = ipv4Address.NewNetwork();
++          NS_LOG_UNCOND("Leaf:" << t << " IP:" << newNet);
++        }
++    }
++  NS_LOG_INFO("Finished connecting leaf switches and hosts");
++
++  if ((g_cc == "DCMPTCP") || g_enableDCTCP || (g_cc == "XMP"))
++  {
++    p2p.SetQueue ("ns3::RedQueue", 
++                  "LinkBandwidth", StringValue (g_upLinkCapacity), 
++                  "LinkDelay", StringValue (g_linkDelay),
++                  "MinTh", DoubleValue (g_upLinkREDminTh),
++                  "MaxTh", DoubleValue (g_upLinkREDmaxTh),
++                  "QueueLimit", UintegerValue (g_upLinkREDQueueLimit));
++  }
++  else
++  {
++    p2p.SetQueue ("ns3::DropTailQueue",
++                  "MaxPackets", UintegerValue (g_upLinkREDQueueLimit));
++  } 
++  p2p.SetDeviceAttribute ("DataRate", StringValue (g_upLinkCapacity));
++//=========== Connect core switches to aggregate switches ===========//
++  NetDeviceContainer ct[g_numSpine][g_numLeaf];
++  ipv4Address.SetBase("30.30.0.0", "255.255.255.0");
++
++  for (uint32_t c = 0; c < g_numSpine; c++)
++    {
++      for (uint32_t p = 0; p < g_numLeaf; p++)
++        {
++          ct[c][p] = p2p.Install(spine.Get(c), leaf.Get(p));
++          ipv4Address.Assign(ct[c][p]);
++          Ipv4Address newNet = ipv4Address.NewNetwork();
++          NS_LOG_UNCOND(newNet);
++        }
++    }
++  NS_LOG_INFO("Finished connecting core and aggregation");
++  //p2p.EnablePcapAll(SetupSimFileName("PCAP"));
++
++  // Populate Global Routing
++  Ipv4GlobalRoutingHelper::PopulateRoutingTables();
++
++  SetupTraces(Spine_Leaf_Host);
++
++  //=========== Initialize settings for On/Off Application ===========//
++  // SINK application - It would be closed doubled the time of source closure!
++  //NS_LOG_INFO("\nSink App Install on following nodes: ");
++  for (uint32_t i = 0; i < allHosts.GetN(); i++)
++    {
++      MpTcpPacketSinkHelper sink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), PORT));
++      ApplicationContainer tmp = sink.Install(allHosts.Get(i));
++      tmp.Start(Seconds(0.0));
++      tmp.Stop(Seconds(g_simTime));
++      sinkApps.push_back(tmp);
++    }
++
++  if (g_trafficMatrix == NEW_INCAST)    
++    Simulator::Schedule(Seconds(g_flowStartTime), &FlowConfigForNewIncast, host);
++  else if (g_trafficMatrix == TYPICAL_INCAST)
++    Simulator::Schedule(Seconds(g_flowStartTime), &FlowConfigForTypicalIncast, host);
++  else if (g_trafficMatrix == NEW_INCAST_BK)
++    Simulator::Schedule(Seconds(g_flowStartTime), &FlowConfigForNewIncastBK, host);
++  else if (g_trafficMatrix == ONE_MAP_ONE)
++    Simulator::Schedule(Seconds(g_flowStartTime), &FlowConfigForOneMapOne, host);
++
++
++
++  SimTimeMonitor();
++
++  NS_LOG_INFO ("Run Simulation.");
++  Simulator::Stop(Seconds(g_simTime));
++  Simulator::Run();
++
++  cout << Simulator::Now().GetSeconds() << " -> Generate Out puts"<< endl;
++
++  OutPutSpine();
++  OutPutLeaf();
++  OutPutHost();
++ 
++  SimOverallResultWritter();
++  SimResultFooterGenerator(); // OveralResultWritter should be called first!
++  //-----------------------------------------------------------------------//
++  Simulator::Destroy();
++  NS_LOG_INFO ("Done.");
++  cout << Simulator::Now().GetSeconds() << " END "<< endl;
++  return 0;
++}
++
++
++
+diff --git a/src/applications/model/mp-tcp-bulk-send-application.cc b/src/applications/model/mp-tcp-bulk-send-application.cc
+index 00d7c5f..8a38164 100644
+--- a/src/applications/model/mp-tcp-bulk-send-application.cc
++++ b/src/applications/model/mp-tcp-bulk-send-application.cc
+@@ -212,6 +212,7 @@ void MpTcpBulkSendApplication::StartApplication (void) // Called at time specifi
+       m_socket->SetOutputFileNameDctcp(m_outputFileNameDctcp);
+       m_socket->SetDctcp(m_DCTCP);
+       m_socket->SetFlowSize(m_maxBytes);
++      NS_LOG_UNCOND ("SEND app:" << m_cc);
+       m_socket->SetCCAlgo(m_cc);
+       m_socket->SetDctcpFastAlpha(m_dctcpFastAlpha);
+       m_socket->SetSlowDownEcnLike(m_slowDownEcnLike);
+diff --git a/src/internet/helper/stone-acl-helper.cc b/src/internet/helper/stone-acl-helper.cc
+new file mode 100644
+index 0000000..684cea0
+--- /dev/null
++++ b/src/internet/helper/stone-acl-helper.cc
+@@ -0,0 +1,41 @@
++/*
++ * Stone ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++
++#include "ns3/stone-acl-helper.h"
++#include "ns3/log.h"
++#include "ns3/ipv4-header.h"
++
++NS_LOG_COMPONENT_DEFINE ("StoneACLHelper");
++using namespace std;
++namespace ns3
++{
++
++
++StoneACLHelper::StoneACLHelper()
++{
++  
++}
++
++void
++StoneACLHelper::CreateAndAggregateObjectFromTypeId (Ptr<Node> node, const std::string typeId)
++{
++  ObjectFactory factory;
++  factory.SetTypeId (typeId);
++  Ptr<Object> obj = factory.Create <Object> ();
++  node->AggregateObject (obj);
++}
++
++void
++StoneACLHelper::Install(Ptr<Node> node, Ipv4Address address, int32_t maxDownlink)
++{
++   NS_LOG_FUNCTION (node->GetId() << address);
++   CreateAndAggregateObjectFromTypeId (node, "ns3::StoneACL");
++   Ptr<StoneACL> stoneACL = node->GetObject<StoneACL> ();
++   stoneACL->SetNetwork (address);
++   stoneACL->SetNode (node);
++   stoneACL->SetMaxDownlink (maxDownlink);
++}
++}//namespace ns3
+diff --git a/src/internet/helper/stone-acl-helper.h b/src/internet/helper/stone-acl-helper.h
+new file mode 100644
+index 0000000..bae2828
+--- /dev/null
++++ b/src/internet/helper/stone-acl-helper.h
+@@ -0,0 +1,36 @@
++/*
++ * Stone ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef STONE_ACL_HELPER_H
++#define STONE_ACL_HELPER_H
++
++#include "ns3/stone-acl.h"
++#include <stdint.h>
++#include <string>
++#include "ns3/object-factory.h"
++#include "ns3/address.h"
++#include "ns3/attribute.h"
++#include "ns3/net-device.h"
++#include "ns3/node-container.h"
++#include "ns3/ipv4-header.h"
++
++using namespace std;
++namespace ns3
++{
++
++class StoneACLHelper
++{
++public:
++  
++  StoneACLHelper ();
++  void Install (Ptr<Node> node, Ipv4Address address, int32_t maxDownlink);
++  void CreateAndAggregateObjectFromTypeId (Ptr<Node> node, const std::string typeId);
++
++};
++
++
++} // namespace ns3
++
++#endif /* IPV4_ADDRESS_HELPER_H */
+diff --git a/src/internet/helper/tracc-acl-helper.cc b/src/internet/helper/tracc-acl-helper.cc
+new file mode 100644
+index 0000000..494b0fe
+--- /dev/null
++++ b/src/internet/helper/tracc-acl-helper.cc
+@@ -0,0 +1,43 @@
++/*
++ * Tracc ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++
++#include "ns3/tracc-acl-helper.h"
++#include "ns3/log.h"
++#include "ns3/ipv4-header.h"
++
++NS_LOG_COMPONENT_DEFINE ("TraccACLHelper");
++using namespace std;
++namespace ns3
++{
++
++
++TraccACLHelper::TraccACLHelper()
++{
++  
++}
++
++void
++TraccACLHelper::CreateAndAggregateObjectFromTypeId (Ptr<Node> node, const std::string typeId)
++{
++  ObjectFactory factory;
++  factory.SetTypeId (typeId);
++  Ptr<Object> obj = factory.Create <Object> ();
++  node->AggregateObject (obj);
++}
++
++void
++TraccACLHelper::Install (Ptr<Node> node, uint32_t numLeaf, uint32_t numHost, uint32_t numSpine, Ipv4Address address)
++{
++  NS_LOG_FUNCTION (node->GetId() << numLeaf << numHost << numSpine);
++  CreateAndAggregateObjectFromTypeId (node, "ns3::TraccACL");
++  Ptr<TraccACL> traccACL = node->GetObject<TraccACL> ();
++  traccACL->Install (node, numLeaf, numHost, numSpine);
++  traccACL->SetNetwork (address);
++  traccACL->SetTimer ();
++}
++
++
++}//namespace ns3
+diff --git a/src/internet/helper/tracc-acl-helper.h b/src/internet/helper/tracc-acl-helper.h
+new file mode 100644
+index 0000000..31715dc
+--- /dev/null
++++ b/src/internet/helper/tracc-acl-helper.h
+@@ -0,0 +1,36 @@
++/*
++ * Tracc ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef TRACC_ACL_HELPER_H
++#define TRACC_ACL_HELPER_H
++
++#include "ns3/tracc-acl.h"
++#include <stdint.h>
++#include <string>
++#include "ns3/object-factory.h"
++#include "ns3/address.h"
++#include "ns3/attribute.h"
++#include "ns3/net-device.h"
++#include "ns3/node-container.h"
++#include "ns3/ipv4-header.h"
++
++using namespace std;
++namespace ns3
++{
++
++class TraccACLHelper
++{
++public:
++  
++  TraccACLHelper ();
++  void CreateAndAggregateObjectFromTypeId (Ptr<Node> node, const std::string typeId);
++  void Install (Ptr<Node> node, uint32_t numLeaf, uint32_t numHost, uint32_t numSpine, Ipv4Address address);
++
++};
++
++
++} // namespace ns3
++
++#endif /* STONE_ACL_HELPER_H */
+diff --git a/src/internet/model/ipv4-global-routing.cc b/src/internet/model/ipv4-global-routing.cc
+index 8e6f33e..bfc4b54 100644
+--- a/src/internet/model/ipv4-global-routing.cc
++++ b/src/internet/model/ipv4-global-routing.cc
+@@ -35,6 +35,7 @@
+ #include "ns3/ecmp-tag.h"
+ //#include "ns3/hash.h"
+ //#include <functional>
++#include "ns3/stone-acl.h"
+ 
+ NS_LOG_COMPONENT_DEFINE ("Ipv4GlobalRouting");
+ 
+@@ -236,7 +237,8 @@ Ipv4GlobalRouting::GetTupleValue(const Ipv4Header &header, Ptr<const Packet> ipP
+ Ptr<Ipv4Route>
+ Ipv4GlobalRouting::LookupGlobal(const Ipv4Header &header, Ptr<const Packet> ipPayload, Ptr<NetDevice> oif)
+ {
+-
++  Ptr<Node> node = m_ipv4->GetObject<Node>();
++  
+   NS_LOG_FUNCTION (this << header.GetDestination() << oif);
+   NS_LOG_LOGIC ("Looking for route for destination " << header.GetDestination());
+   Ptr<Ipv4Route> rtentry = 0;
+@@ -620,6 +622,10 @@ Ipv4GlobalRouting::RouteInput  (Ptr<const Packet> p, const Ipv4Header &header, P
+                                 LocalDeliverCallback lcb,
+                                 ErrorCallback ecb)
+ { 
++  Ptr<Node> node = m_ipv4->GetObject<Node>();
++  NS_LOG_INFO("routeinput: " << node->GetId());
++
++  
+   NS_LOG_FUNCTION (this << p << header << header.GetSource () << header.GetDestination () << idev << &lcb << &ecb);
+   // Check if input device supports IP
+   NS_ASSERT (m_ipv4->GetInterfaceForDevice (idev) >= 0);
+diff --git a/src/internet/model/ipv4-l3-protocol.cc b/src/internet/model/ipv4-l3-protocol.cc
+index 61f5862..dd6c41b 100644
+--- a/src/internet/model/ipv4-l3-protocol.cc
++++ b/src/internet/model/ipv4-l3-protocol.cc
+@@ -32,6 +32,8 @@
+ #include "ns3/ipv4-header.h"
+ #include "ns3/boolean.h"
+ #include "ns3/ipv4-routing-table-entry.h"
++#include "ns3/stone-acl.h"
++#include "ns3/tracc-acl.h"
+ 
+ #include "loopback-net-device.h"
+ #include "arp-l3-protocol.h"
+@@ -526,6 +528,7 @@ Ipv4L3Protocol::Receive ( Ptr<NetDevice> device, Ptr<const Packet> p, uint16_t p
+       socket->ForwardUp (packet, ipHeader, ipv4Interface);
+     }
+ 
++  NS_LOG_LOGIC ("hehehe");
+   NS_ASSERT_MSG (m_routingProtocol != 0, "Need a routing protocol object to process packets");
+   if (!m_routingProtocol->RouteInput (packet, ipHeader, device,
+                                       MakeCallback (&Ipv4L3Protocol::IpForward, this),
+@@ -883,6 +886,14 @@ Ipv4L3Protocol::IpForward (Ptr<Ipv4Route> rtentry, Ptr<const Packet> p, const Ip
+       m_dropTrace (header, packet, DROP_TTL_EXPIRED, m_node->GetObject<Ipv4> (), interface);
+       return;
+     }
++    
++  Ptr<StoneACL> stoneAcl = m_node->GetObject<StoneACL>();
++  if (stoneAcl)
++    stoneAcl->ConductTag(packet, header, interface);
++  Ptr<TraccACL> traccACL = m_node->GetObject<TraccACL>();
++  if (traccACL)
++    traccACL->TagCount(packet, header, interface);
++  
+   m_unicastForwardTrace (ipHeader, packet, interface);
+   SendRealOut (rtentry, packet, ipHeader);
+ }
+diff --git a/src/internet/model/mp-tcp-socket-base.cc b/src/internet/model/mp-tcp-socket-base.cc
+index 322d030..c32d5fc 100644
+--- a/src/internet/model/mp-tcp-socket-base.cc
++++ b/src/internet/model/mp-tcp-socket-base.cc
+@@ -30,6 +30,10 @@
+ #include "ns3/ect-tag.h"
+ #include "ns3/control-tag.h"
+ #include "ns3/ecmp-tag.h"
++#include "ns3/rl-tag.h"
++#include "ns3/li-cx-tag.h"
++#include "ns3/fb-li-tag.h"
++#include "ns3/fb-tag.h"
+ 
+ //#define PLOT
+ //#define PLOT_DCTCP
+@@ -54,14 +58,14 @@ MpTcpSocketBase::GetTypeId (void)
+                      "Congestion control algorithm",
+                      EnumValue (Linked_Increases),
+                      MakeEnumAccessor (&MpTcpSocketBase::SetCongestionCtrlAlgo),
+-                     MakeEnumChecker (Uncoupled_TCPs, "Uncoupled_TCPs", Fully_Coupled, "Fully_Coupled", RTT_Compensator, "RTT_Compensator",
++                     MakeEnumChecker (Uncoupled_TCPs, "Uncoupled_TCPs", Fully_Coupled, "Fully_Coupled", RTT_Compensator, "RTT_Compensator", DCMPTCP, "DCMPTCP",
+                            Linked_Increases, "Linked_Increases", COUPLED_INC, "COUPLED_INC", COUPLED_EPSILON, "COUPLED_EPSILON",
+                            COUPLED_SCALABLE_TCP, "COUPLED_SCALABLE_TCP", COUPLED_FULLY, "COUPLED_FULLY", UNCOUPLED, "UNCOUPLED", XMP, "XMP", Fast_Uncoupled, "Fast_Uncoupled", Fast_Increases, "Fast_Increases", XCA, "XCA"))
+       .AddAttribute ("SchedulingAlgorithm",
+                      "Algorithm for data distribution between sub-flows",
+                      EnumValue (Round_Robin),
+                      MakeEnumAccessor (&MpTcpSocketBase::SetDataDistribAlgo),
+-                     MakeEnumChecker (Round_Robin, "Round_Robin"))
++                     MakeEnumChecker (Round_Robin, "Round_Robin", DC_SCHE, "DC_SCHE"))
+       .AddAttribute ("PathManagement",
+                      "Mechanism for establishing new sub-flows",
+                      EnumValue (NdiffPorts),
+@@ -202,6 +206,16 @@ MpTcpSocketBase::GetTypeId (void)
+                    UintegerValue (10000000), // 10MB
+                    MakeUintegerAccessor (&MpTcpSocketBase::m_ADCTthresh),
+                    MakeUintegerChecker<uint32_t> ())
++    .AddAttribute ("SlaveIW",
++                   "Initial cwnd size",
++                   UintegerValue (2),
++                   MakeUintegerAccessor (&MpTcpSocketBase::m_slaveIW),
++                   MakeUintegerChecker<uint32_t> ())
++    .AddAttribute ("DCSCHEthresh",
++                   "Threshold of DCSCHE",
++                   UintegerValue (100),
++                   MakeUintegerAccessor (&MpTcpSocketBase::m_dcsche_th),
++                   MakeUintegerChecker<uint32_t> ())
+ //     .AddAttribute ("SlowDownEcnLike",
+ //                    "Slow down sending rate based on ECN",
+ //                    BooleanValue (false),
+@@ -249,6 +263,7 @@ MpTcpSocketBase::MpTcpSocketBase () :
+   FullAcks = 0;
+   pAck = 0;
+   TimeOuts = 0;
++  DCMPTCPCutDowns = 0;
+   FastReTxs = 0;
+   FastRecoveries = 0;
+   SlowDownHits = 0;
+@@ -439,11 +454,23 @@ MpTcpSocketBase::ReadOptions (Ptr<Packet> pkt, const TcpHeader& mptcpHeader)
+       opt = mp_options[j];
+       if ((opt->optName == OPT_MPC) && hasSyn && (mpRecvState == MP_NONE))
+         { // SYN+ACK would be send later on by ProcessSynRcvd(...)
+-          mpRecvState = MP_MPC;
+-          mpEnabled = true;
+-          remoteToken = ((OptMultipathCapable *) opt)->senderToken;
+-          if (remoteToken == 0)
+-            NS_ASSERT(remoteToken != 0); // Correct condition
++          if (!m_rlBit)
++          {
++            mpRecvState = MP_MPC;
++            mpEnabled = true;
++            remoteToken = ((OptMultipathCapable *) opt)->senderToken;
++            if (remoteToken == 0)
++              NS_ASSERT(remoteToken != 0); // Correct condition
++          }
++          else
++          {
++            NS_LOG_INFO("With RL_Tag. Degrade now!");
++            oldAlgoCC = AlgoCC;
++            oldMaxSubflows = maxSubflows;
++            
++            maxSubflows = 1;
++            AlgoCC = Uncoupled_TCPs;
++          }
+           return true;
+         }
+       else
+@@ -725,6 +752,12 @@ MpTcpSocketBase::ProcessSynSent (uint8_t sFlowIdx, Ptr<Packet> packet, const Tcp
+           fLowStartTime = Simulator::Now ().GetSeconds ();     // It seems to be in right location for FCT!!
+           if ((m_ratePlotCl && (flowType.compare ("Short") != 0)) || (m_largePlotting && (flowType.compare ("Short") != 0)))
+             RateTracerCl ();
++          if (!mpEnabled)
++          {
++            NS_LOG_INFO("SYN+ACK w/o OPT_MPC. Degrade now!");
++            maxSubflows = 1;
++            AlgoCC = Uncoupled_TCPs;
++          }
+         }NS_LOG_INFO("(" << sFlow->routeId << ") "<< TcpStateName[sFlow->state] << " -> ESTABLISHED");
+       sFlow->state = ESTABLISHED;
+       sFlow->retxEvent.Cancel ();
+@@ -1095,6 +1128,8 @@ MpTcpSocketBase::ReceivedData (uint8_t sFlowIdx, Ptr<Packet> p, const TcpHeader&
+           else if (optDSN->subflowSeqNumber > sFlow->RxSeqNumber)
+             { /* Received packet is out of order at sub-flow level */
+               // This condition might occurs when a packet get drop...Does this condition mean that packet should be out of order at connection level? YES
++              NS_LOG_INFO(optDSN->dataSeqNumber << " " << nextRxSequence);
++              NS_LOG_INFO(optDSN->subflowSeqNumber << " " << sFlow->RxSeqNumber);
+               NS_ASSERT(optDSN->dataSeqNumber > nextRxSequence);
+               StoreUnOrderedData (
+                   new DSNMapping (sFlowIdx, optDSN->dataSeqNumber, optDSN->dataLevelLength, optDSN->subflowSeqNumber,
+@@ -1140,6 +1175,8 @@ MpTcpSocketBase::ReceivedAck (uint8_t sFlowIdx, Ptr<Packet> packet, const TcpHea
+   Ptr<MpTcpSubFlow> sFlow = subflows[sFlowIdx];
+   uint32_t ack = (mptcpHeader.GetAckNumber ()).GetValue ();
+   sFlow->g_AckSeqNumber = ack;
++  
++  NS_LOG_INFO ("sf:" << sFlowIdx <<" cwnd:"<< sFlow->cwnd.Get());
+ 
+   if ((m_DCTCP && sFlow->state == ESTABLISHED) || m_dctcpFastReTxRecord)
+     { // Danger: m_dctcpFastReTxRecord should off in normal run
+@@ -1582,9 +1619,13 @@ MpTcpSocketBase::SendDataPacket (uint8_t sFlowIdx, uint32_t size, bool withAck)
+   NS_ASSERT(packetSize <= size);
+   NS_ASSERT(packetSize == p->GetSize ());
+ 
++  NS_LOG_INFO ("CC:" << AlgoCC);
+   // @SendDataPacket -> Add ECT Tag on every data packet... We do this for ack packets as well
+-  if (m_DCTCP || AlgoCC == XMP || m_ecn)
++  if (m_DCTCP || AlgoCC == XMP || m_ecn || AlgoCC == DCMPTCP)
++  {
++    //NS_LOG_INFO ("Data packets with ECT." << (AlgoCC == DCMPTCP));
+     AddPacketTag(p, ECT_TAG); //AddEctTag(p);
++  }
+   // @SendDataPacket
+   if (m_disjoinPath && flowType.compare ("Large") == 0)
+     AddEcmpTag(p, sFlow->routeId);
+@@ -1678,7 +1719,7 @@ MpTcpSocketBase::SendDataPacket (uint8_t sFlowIdx, uint32_t size, bool withAck)
+   sFlow->DATA.push_back (make_pair (Simulator::Now ().GetSeconds (), tmp));
+ #endif
+ 
+-  NS_LOG_LOGIC(Simulator::Now().GetSeconds() << " ["<< m_node->GetId()<< "] SendDataPacket->  " << header <<" dSize: " << packetSize<< " sFlow: " << sFlow->routeId);
++  NS_LOG_LOGIC(Simulator::Now().GetSeconds() << " ["<< m_node->GetId()<< "] SendDataPacket->  " << sFlow->sAddr<<" "<<sFlow->dAddr<<" "<< header <<" dSize: " << packetSize<< " sFlow: " << sFlow->routeId);
+ 
+   // Do some updates.....
+   sFlow->rtt->SentSeq (SequenceNumber32 (sFlow->TxSeqNumber), packetSize); // Notify the RTT of a data packet sent
+@@ -1856,7 +1897,7 @@ MpTcpSocketBase::DoRetransmit (uint8_t sFlowIdx)
+   header.SetPaddingLength (plen);
+ 
+   // @DoRetransmit -> Add ECT Tag on every data packet... We do this for ack packets as well
+-  if (m_DCTCP || AlgoCC == XMP || m_ecn)
++  if (m_DCTCP || AlgoCC == XMP || m_ecn || AlgoCC == DCMPTCP)
+     AddPacketTag(pkt, ECT_TAG);
+   // @DoRetransmit
+   if (m_disjoinPath && flowType.compare ("Large") == 0)
+@@ -1926,7 +1967,7 @@ MpTcpSocketBase::DoRetransmit (uint8_t sFlowIdx, DSNMapping* ptrDSN)
+   header.SetPaddingLength (plen);
+ 
+   // @DoRetransmit -> Add ECT Tag on every data packet... We do this for ack packets as well
+-  if (m_DCTCP || AlgoCC == XMP || m_ecn)
++  if (m_DCTCP || AlgoCC == XMP || m_ecn || AlgoCC == DCMPTCP)
+     AddPacketTag (pkt, ECT_TAG);
+   // @DoRetransmit
+   if (m_disjoinPath && flowType.compare ("Large") == 0)
+@@ -2095,7 +2136,8 @@ MpTcpSocketBase::Connect (Ipv4Address servAddr, uint16_t servPort)
+   sFlow->sAddr = m_endPoint->GetLocalAddress ();
+   sFlow->sPort = m_endPoint->GetLocalPort ();
+   sFlow->MSS = segmentSize;
+-  sFlow->cwnd = sFlow->MSS;
++  //sFlow->cwnd = sFlow->MSS;
++  sFlow->cwnd = this->GetInitialCwnd() * sFlow->MSS;
+   NS_LOG_UNCOND ("Connect -> SegmentSize: " << sFlow->MSS << " tcpSegmentSize: " << m_segmentSize << " segmentSize: " << segmentSize << "SendingBufferSize: " << sendingBuffer.bufMaxSize);
+ 
+   // This is master subsocket (master subflow) then its endpoint is the same as connection endpoint.
+@@ -2264,7 +2306,31 @@ MpTcpSocketBase::SendPendingData (uint8_t sFlowIdx)
+         SlowDownEcnLike (sFlowIdx);
+       else
+         SlowDown (sFlowIdx);
++      
++      DCMPTCPCutDowns++;
+     }
++    //DCMPTCP
++    if (AlgoCC == DCMPTCP && sFlowIdx < maxSubflows && m_licx > 0 && m_fb > 0 && subflows[sFlowIdx]->state == ESTABLISHED
++        && subflows[sFlowIdx]->dcmptcp_maxseq < (subflows[sFlowIdx]->highestAck + 1))
++    {
++      NS_LOG_INFO ("Cutting down CWND because we've received LICX:" << "sub" << (int32_t)sFlowIdx << " licx" << (int32_t)m_licx);
++      NS_ASSERT(client);
++      Ptr<MpTcpSubFlow> sFlow = subflows[sFlowIdx];
++      int32_t old_cwnd = sFlow->cwnd.Get ();
++      
++      double tmp = old_cwnd * (1 - 1.0 * m_licx / 16 / 2);
++
++      if (tmp < 0)
++        tmp = 0;
++      sFlow->cwnd = std::max ((uint32_t) tmp, (m_cwndMin * sFlow->MSS));
++      sFlow->ssthresh = std::max (sFlow->MSS, sFlow->cwnd.Get ());
++      
++      NS_LOG_INFO ("o:" << old_cwnd << " n:" << sFlow->cwnd.Get () << " maxseq:" <<subflows[sFlowIdx]->dcmptcp_maxseq<< " "<< subflows[sFlowIdx]->TxSeqNumber << " highestackp1:"<< (subflows[sFlowIdx]->highestAck + 1));
++      subflows[sFlowIdx]->dcmptcp_maxseq = subflows[sFlowIdx]->TxSeqNumber;
++      
++      DCMPTCPCutDowns++;
++    }
++    
+   /*
+   // XMP: If we have received ECN echo in some of the received ACKs, cut the cwnd by half only once per round
+   if (AlgoCC == XMP && sFlowIdx < maxSubflows && m_eceBit > 0 && subflows[sFlowIdx]->state == ESTABLISHED)
+@@ -2397,6 +2463,13 @@ MpTcpSocketBase::getSubflowToUse ()
+   case Round_Robin:
+     nextSubFlow = (lastUsedsFlowIdx + 1) % subflows.size ();
+     break;
++  case DC_SCHE:
++    if (nextTxSequence <= m_dcsche_th * 1024)
++      nextSubFlow = 0;
++    else
++      nextSubFlow = (lastUsedsFlowIdx + 1) % subflows.size ();
++    NS_LOG_INFO("DC_SCHE:" << nextTxSequence << " " << m_dcsche_th << " " << (uint32_t) nextSubFlow);
++    break;
+   default:
+     break;
+     }
+@@ -2459,6 +2532,7 @@ MpTcpSocketBase::ReduceCWND (uint8_t sFlowIdx, DSNMapping* ptrDSN)
+   case UNCOUPLED:
+   case XMP:
+   case XCA:
++  case DCMPTCP:
+   //sFlow->ssthresh = std::max (2 * mss, BytesInFlight (sFlowIdx) / 2);
+     sFlow->ssthresh = std::max (2 * mss, flightSize/2);
+     sFlow->cwnd = sFlow->ssthresh + 3 * mss;
+@@ -2568,6 +2642,11 @@ MpTcpSocketBase::Retransmit (uint8_t sFlowIdx)
+       //sFlow->m_sumRTT = 0;
+       //sFlow->m_nECE = 0;
+     }
++    //DCMPTCP
++    if (AlgoCC == DCMPTCP)
++    {
++      sFlow->dcmptcp_maxseq = sFlow->TxSeqNumber;
++    }
+ 
+   //if (!(sendingBuffer->Empty() && sFlow->mapDSN.size() > 0))
+   sFlow->rtt->IncreaseMultiplier ();  // Double the next RTO
+@@ -2844,13 +2923,33 @@ MpTcpSocketBase::SendEmptyPacket (uint8_t sFlowIdx, uint8_t flags)
+   // @SendEmptyPacket
+   if (m_ceBit > 0 && isAck && sFlow->state == ESTABLISHED && server)
+     AddPacketTag (p, ECE_TAG);
++  
++  if (m_licx > 0 && isAck && sFlow->state == ESTABLISHED && server)
++  {
++    FBLITag fbliTag;
++    fbliTag.SetFBLI (m_licx - 1);
++    p->AddPacketTag (fbliTag);
++    NS_LOG_INFO ("FBLI marked at receiver:" << (int32_t)m_licx);
++  }
++  
++  if (isAck && sFlow->state == ESTABLISHED && server)
++  {    
++    FBTag fbTag;
++    fbTag.SetFB (1);
++    p->AddPacketTag (fbTag);
++    NS_LOG_INFO ("FB marked at receiver");
++  }
++  else if (server)
++    NS_LOG_INFO ("No FB marked at receiver");
++  
++  
+ 
+   // @SendEmptyPacket -> Add control packet tag
+   if (hasSyn || hasFin || (isAck && client))
+     AddPacketTag (p, CP_TAG); //AddContPktTag(p);
+ 
+   // @SendEmptyPacket -> Add ECT Tag on ACK packet of DCTCP/XMP traffic... We do this for ack data packet as well.
+-  if (m_DCTCP || AlgoCC == XMP || m_ecn)
++  if (m_DCTCP || AlgoCC == XMP || m_ecn || AlgoCC == DCMPTCP)
+     AddPacketTag (p, ECT_TAG); //AddEctTag(p);
+ 
+   m_tcp->SendPacket (p, header, sFlow->sAddr, sFlow->dAddr, FindOutputNetDevice (sFlow->sAddr));
+@@ -2872,7 +2971,7 @@ MpTcpSocketBase::SendEmptyPacket (uint8_t sFlowIdx, uint8_t flags)
+     }
+ 
+   //if (!isAck)
+-  NS_LOG_INFO("("<< (int)sFlowIdx<<") SendEmptyPacket-> "<< header <<" Length: "<< (int)header.GetLength());
++  NS_LOG_INFO("("<< (int)sFlowIdx<<") SendEmptyPacket-> "<< sFlow->sAddr << sFlow->dAddr <<header <<" Length: "<< (int)header.GetLength());
+ }
+ 
+ //void
+@@ -2954,18 +3053,46 @@ MpTcpSocketBase::ExtractPacketTags (Ptr<Packet> p)
+ {
+   m_ceBit = 0;
+   m_eceBit = 0;
++  m_rlBit = 0;
++  m_licx = 0;
++  m_fb = 0;
++  FBTag fb;
++  bool fb_exist = p->RemovePacketTag (fb);
++  if (fb_exist)
++  {
++    m_fb = fb.GetFB ();
++  }
++  
++  RLTag rlTag;
++  bool done = p->RemovePacketTag (rlTag);
++  if (done)
++  {
++    m_rlBit = rlTag.GetRL ();
++  }
++  
+   CeTag tag;
+-  bool done = p->RemovePacketTag (tag);
++  done = p->RemovePacketTag (tag);
+   if (done)
+     {
+       m_ceBit = tag.GetCe ();
++      NS_LOG_INFO ("ce marked receive");
+     }
++    
+   EceTag ece;
+   done = p->RemovePacketTag (ece);
+   if (done)
+     {
+       m_eceBit = ece.GetEce ();
+     }
++  
++  LICXTag licx;
++  done = p->RemovePacketTag (licx);
++  if (done)
++  {
++    m_licx = licx.GetLICX ();
++    NS_LOG_INFO ("Got licx:" << (int32_t)m_licx);
++  }
++    
+   ControlTag ct; // Just remove it from packet.
+   p->RemovePacketTag (ct);
+   EctTag ect;
+@@ -2983,13 +3110,16 @@ MpTcpSocketBase::DoForwardUp (Ptr<Packet> p, Ipv4Header header, uint16_t port, P
+     }NS_LOG_FUNCTION(this<< " SubflowSize["<<subflows.size() << "]");
+   Address fromAddress = InetSocketAddress (header.GetSource (), port);
+   Address toAddress = InetSocketAddress (header.GetDestination (), m_endPoint->GetLocalPort ());
+-
++  
++  NS_LOG_INFO(header.GetSource () << "->" << header.GetDestination ());
+   m_localAddress = header.GetDestination ();
+   m_remoteAddress = header.GetSource ();
+ 
+   // Peel off TCP header and do validity checking
+   TcpHeader mptcpHeader;
++  NS_LOG_INFO(mptcpHeader);
+   p->RemoveHeader (mptcpHeader);
++  NS_LOG_INFO(mptcpHeader);
+ 
+   // DCTCP
+   ExtractPacketTags(p);
+@@ -3006,6 +3136,10 @@ MpTcpSocketBase::DoForwardUp (Ptr<Packet> p, Ipv4Header header, uint16_t port, P
+       NS_ASSERT(server && m_state == LISTEN); NS_LOG_UNCOND("Listening socket receives SYN packet, it need to be CLONED... " << mptcpHeader);
+       // Update the flow control window
+       remoteRecvWnd = (uint32_t) mptcpHeader.GetWindowSize ();
++ 
++      oldAlgoCC = AlgoCC;
++      oldMaxSubflows = maxSubflows;
++      
+       // We need to define another ReadOption with no subflow in it
+       if (ReadOptions (p, mptcpHeader) == false)
+         return;
+@@ -3018,6 +3152,8 @@ MpTcpSocketBase::DoForwardUp (Ptr<Packet> p, Ipv4Header header, uint16_t port, P
+       remoteToken = 0;
+       localToken = 0;
+       remoteRecvWnd = 1;
++      AlgoCC = oldAlgoCC;
++      maxSubflows = oldMaxSubflows;
+       return;
+     }
+   // Accepted sockets being dealt with from here on .......
+@@ -3027,6 +3163,7 @@ MpTcpSocketBase::DoForwardUp (Ptr<Packet> p, Ipv4Header header, uint16_t port, P
+ 
+   if (client && sFlowIdx > maxSubflows)
+     exit (20);
++  //NS_LOG_UNCOND(sFlowIdx << " " << (uint32_t)maxSubflows);
+   NS_ASSERT_MSG(sFlowIdx <= maxSubflows, "Subflow number should be smaller than MaxNumOfSubflows");
+   NS_ASSERT_MSG(
+       sFlowIdx >= 0,
+@@ -3155,7 +3292,11 @@ MpTcpSocketBase::InitiateSubflows ()
+         sFlow->dAddr = remote;
+         sFlow->dPort = m_remotePort; // TODO Is this right?
+         sFlow->MSS = segmentSize;
+-        sFlow->cwnd = sFlow->MSS;               // We should do this ... since cwnd is 0
++        //sFlow->cwnd = sFlow->MSS;               // We should do this ... since cwnd is 0
++        if (AlgoCC == DCMPTCP)
++          sFlow->cwnd = m_slaveIW * sFlow->MSS;
++        else
++          sFlow->cwnd = this->GetInitialCwnd() * sFlow->MSS;
+         sFlow->state = SYN_SENT;
+         sFlow->cnTimeout = m_cnTimeout;
+         sFlow->cnRetries = m_cnRetries;
+@@ -3211,7 +3352,11 @@ MpTcpSocketBase::InitiateSingleSubflows (uint16_t randomPort)
+   sFlow->dAddr = m_endPoint->GetPeerAddress ();
+   sFlow->dPort = m_endPoint->GetPeerPort ();
+   sFlow->MSS = segmentSize;
+-  sFlow->cwnd = sFlow->MSS;
++  //sFlow->cwnd = sFlow->MSS;
++  if (AlgoCC == DCMPTCP)
++    sFlow->cwnd = m_slaveIW * sFlow->MSS;
++  else
++    sFlow->cwnd = this->GetInitialCwnd() * sFlow->MSS;
+   sFlow->state = SYN_SENT;
+   sFlow->cnTimeout = m_cnTimeout;
+   sFlow->cnRetries = m_cnRetries;
+@@ -3393,7 +3538,10 @@ MpTcpSocketBase::ReadUnOrderedData ()
+               sFlow->AccumulativeAck = true; //TODO TEMP
+             }
+           else
+-            NS_ASSERT(ptrDSN->subflowSeqNumber < sFlow->RxSeqNumber);
++            {
++              NS_LOG_INFO(ptrDSN->subflowSeqNumber << sFlow->RxSeqNumber);
++              NS_ASSERT(ptrDSN->subflowSeqNumber < sFlow->RxSeqNumber);
++            }
+ 
+           NotifyDataRecv ();
+           unOrdered.erase (current);
+@@ -3511,38 +3659,42 @@ MpTcpSocketBase::PrintCC (uint32_t cc)
+     return "LI"; //1
+     break;
+   case 2:
+-    return "RC"; //2
++    return "DCMPTCP";           //2
+     break;
+   case 3:
+-    return "FC"; //3
++    return "RC"; //
+     break;
+   case 4:
+-    return "CST";            //4
++    return "FC"; //
+     break;
+   case 5:
+-    return "UC";             //5
++    return "CST";            //
+     break;
+   case 6:
+-    return "CE";             //6
++    return "UC";             //
+     break;
+   case 7:
+-    return "CI";             //7
++    return "CE";             //
+     break;
+   case 8:
+-    return "CF";             //8
++    return "CI";             //
+     break;
+   case 9:
+-    return "XMP";            //9
++    return "CF";             //
+     break;
+   case 10:
+-    return "FU";            //10
++    return "XMP";            //
+     break;
+   case 11:
+-    return "FI";            //11
++    return "FU";            //
+     break;
+   case 12:
+-    return "XCA";           //12
++    return "FI";            //
+     break;
++  case 13:
++    return "XCA";           //
++  break;
++
+   default:
+     exit (200);
+     return "Unknown";
+@@ -3812,6 +3964,10 @@ MpTcpSocketBase::GetSocketModel()
+     {
+       tmpSocket = ft + "XMP";
+     }
++   else if (AlgoCC == DCMPTCP)
++    {
++      tmpSocket = ft + "DCMPTCP";
++    }
+   else
+     {
+       tmpSocket = ft + "UN";
+@@ -3836,8 +3992,11 @@ MpTcpSocketBase::DoDoGenerateOutPutFile(TypeId tid)
+       //<< "[."  << IsActive(m_DCTCP)  << ".]"
+         << "[#"  << goodput / 1000000  << "#]"
+         << "[*"  << (Simulator::Now ().GetSeconds () - fLowStartTime)       << "*]"
++        << "[T"  << fLowStartTime      << "T]"
++        << "[S"  << nextTxSequence - 1 << "S]"
+         << "[$"  << TimeOuts           << "$]"
+         << "[!"  << FastReTxs          << "!]"
++        << "[x"  << DCMPTCPCutDowns    << "x]"
+         << "[("  << pAck               << ")]"
+         << "[@"  << FullAcks           << "@]"
+         << "[^"  << FastRecoveries     << "^]"
+@@ -3855,14 +4014,14 @@ MpTcpSocketBase::DoDoGenerateOutPutFile(TypeId tid)
+       //<< "[{SDEL:"  << m_slowDownEcnLike  << "}]"
+       //<< "[{XMP:"   << (AlgoCC == XMP)    << "}]"
+         << "[{"  << GetSocketModel()   << "}]"
+-        << "[�"  << PrintCC(AlgoCC)    << "�]"
++        << "[{"  << PrintCC(AlgoCC)    << "}]"
+         << "[-"  << SlowDownHits       << "-]"
+         << "[{DS"<< m_dynamicSubflow   << "}]"
+         << "[{IT"<< m_incastThreshold  << "}]"
+         << "[{ET"<< m_incastExitThreshold << "}]"
+         << "[{IC"<< m_incastCounter    << "}]"
+         << "[."  << m_incastEnterHits  << ".]"
+-        << "[�"  << m_incastExitHits   << "�]"
++        << "[{"  << m_incastExitHits   << "}]"
+         << "[{CM"<< m_cwndMin          << "}]"
+         << "[{RS"<< m_rwndScale        << "}]"
+         << "[{B" << m_backoffBeta      << "_G" << m_initGamma << "}]"
+@@ -5713,7 +5872,11 @@ MpTcpSocketBase::LookupSubflow (Ipv4Address src, uint32_t srcPort, Ipv4Address d
+   sFlow->sAddr = src;
+   sFlow->sPort = srcPort;
+   sFlow->MSS = segmentSize;
+-  sFlow->cwnd = sFlow->MSS;
++  if (AlgoCC == DCMPTCP)
++    sFlow->cwnd = m_slaveIW * sFlow->MSS;
++  else
++    sFlow->cwnd = this->GetInitialCwnd() * sFlow->MSS;
++  //sFlow->cwnd = sFlow->MSS;
+   sFlow->state = LISTEN;
+   sFlow->cnTimeout = m_cnTimeout;
+   sFlow->cnRetries = m_cnRetries;
+@@ -5873,6 +6036,7 @@ MpTcpSocketBase::OpenCWND (uint8_t sFlowIdx, uint32_t ackedBytes)
+         sFlow->cwnd += static_cast<double> (adder);
+         break;
+       case RTT_Compensator:
++      case DCMPTCP:
+         calculateAlpha (); // Calculate alpha per drop or RTT...RFC 6356 (Section 4.1)
+         adder = std::min (alpha * sFlow->MSS * sFlow->MSS / totalCwnd, static_cast<double> (sFlow->MSS * sFlow->MSS) / cwnd);
+         adder = std::max (1.0, adder);
+@@ -6121,6 +6285,9 @@ MpTcpSocketBase::SetCCAlgo (string cc)
+     AlgoCC = Fast_Increases;
+   else if (cc == "XCA")
+     AlgoCC = XCA;
++  else if (cc == "DCMPTCP")
++    AlgoCC = DCMPTCP;
++  NS_LOG_INFO (AlgoCC << cc <<DCMPTCP);
+ }
+ 
+ void
+@@ -6504,6 +6671,8 @@ MpTcpSocketBase::SlowDown (uint8_t sFlowIdx)
+   assert(!m_slowDownXmpLike);
+ //assert(!m_slowDownEcnLike); // Should be turn of for MMPTCP if 1st phase need dctcp and 2th phase ecn
+   assert(AlgoCC != XMP && m_DCTCP);
++  
++  NS_LOG_FUNCTION(this);
+   SlowDownHits++;
+ 
+   Ptr<MpTcpSubFlow> sFlow = subflows[sFlowIdx];
+diff --git a/src/internet/model/mp-tcp-socket-base.h b/src/internet/model/mp-tcp-socket-base.h
+index b619dbc..dceee33 100644
+--- a/src/internet/model/mp-tcp-socket-base.h
++++ b/src/internet/model/mp-tcp-socket-base.h
+@@ -103,6 +103,7 @@ public: // public variables
+   uint32_t FullAcks;
+   uint32_t TimeOuts;
+   uint32_t FastReTxs;
++  uint32_t DCMPTCPCutDowns;
+   uint32_t FastRecoveries;
+   uint64_t SlowDownHits;
+   bool flowCompletionTime;
+@@ -338,6 +339,9 @@ protected: // protected variables
+   uint8_t            currentSublow;
+   uint8_t			m_ceBit;
+   uint8_t			m_eceBit;
++  uint8_t			m_rlBit;  
++  uint8_t			m_licx;
++  uint8_t			m_fb;
+   bool              m_DCTCP;      		//< Socket DCTCP capability
+   double            m_g;
+   bool              m_dctcpAlphaPerAck;
+@@ -374,6 +378,14 @@ protected: // protected variables
+   CongestionCtrl_t AlgoCC;       // Algorithm for Congestion Control
+   DataDistribAlgo_t distribAlgo; // Algorithm for Data Distribution
+   PathManager_t pathManager;        // Mechanism for subflow establishement
++  
++  // For DCMPTCP handshake
++  CongestionCtrl_t oldAlgoCC;
++  uint8_t oldMaxSubflows;
++  
++  //DCMPTCP
++  uint32_t m_slaveIW;
++  uint32_t m_dcsche_th;
+ 
+   // Window management variables
+   uint32_t m_ssThresh;           // Slow start threshold
+diff --git a/src/internet/model/mp-tcp-subflow.cc b/src/internet/model/mp-tcp-subflow.cc
+index 90a50c9..eac2c27 100644
+--- a/src/internet/model/mp-tcp-subflow.cc
++++ b/src/internet/model/mp-tcp-subflow.cc
+@@ -80,6 +80,7 @@ MpTcpSubFlow::MpTcpSubFlow() :
+   dctcp_marked = 0;
+   dctcp_alpha_update_seq = 0;
+   dctcp_maxseq = 0;
++  dcmptcp_maxseq = 0;
+   dctcp_alpha = 0.0;
+   fast_alpha = 0.0;
+   curEcnState = false;
+diff --git a/src/internet/model/mp-tcp-subflow.h b/src/internet/model/mp-tcp-subflow.h
+index f91a0d7..59c7a87 100644
+--- a/src/internet/model/mp-tcp-subflow.h
++++ b/src/internet/model/mp-tcp-subflow.h
+@@ -99,6 +99,7 @@ public:
+   uint32_t dctcp_marked;
+   uint32_t dctcp_alpha_update_seq;
+   uint32_t dctcp_maxseq;
++  uint32_t dcmptcp_maxseq;
+   double dctcp_alpha;
+   double fast_alpha;
+   bool curEcnState;
+diff --git a/src/internet/model/mp-tcp-typedefs.h b/src/internet/model/mp-tcp-typedefs.h
+index 18fce7e..5fe77fe 100644
+--- a/src/internet/model/mp-tcp-typedefs.h
++++ b/src/internet/model/mp-tcp-typedefs.h
+@@ -36,22 +36,24 @@ typedef enum
+ {
+   Uncoupled_TCPs,         // 0
+   Linked_Increases,       // 1
+-  RTT_Compensator,        // 2
+-  Fully_Coupled,          // 3
+-  COUPLED_SCALABLE_TCP,   // 4
+-  UNCOUPLED,              // 5
+-  COUPLED_EPSILON,        // 6
+-  COUPLED_INC,            // 7
+-  COUPLED_FULLY,          // 8
+-  XMP,                    // 9
+-  Fast_Uncoupled,         // 10
+-  Fast_Increases,         // 11
+-  XCA                     // 12
++  DCMPTCP,// 2
++  RTT_Compensator,        // 3
++  Fully_Coupled,          // 4
++  COUPLED_SCALABLE_TCP,   // 5
++  UNCOUPLED,              // 6
++  COUPLED_EPSILON,        // 7
++  COUPLED_INC,            // 8
++  COUPLED_FULLY,          // 9
++  XMP,                    // 10
++  Fast_Uncoupled,         // 11
++  Fast_Increases,         // 12
++  XCA                     // 13
+ } CongestionCtrl_t;
+ 
+ typedef enum
+ {
+-  Round_Robin
++  Round_Robin,
++  DC_SCHE
+ } DataDistribAlgo_t;
+ 
+ typedef enum
+diff --git a/src/internet/model/stone-acl.cc b/src/internet/model/stone-acl.cc
+new file mode 100644
+index 0000000..b051647
+--- /dev/null
++++ b/src/internet/model/stone-acl.cc
+@@ -0,0 +1,108 @@
++/*
++ * Stone ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++
++#include "ns3/stone-acl.h"
++#include "ns3/log.h"
++#include "ns3/node.h"
++#include "ns3/packet.h"
++#include "ns3/log.h"
++#include "ns3/callback.h"
++#include "ns3/ipv4-address.h"
++#include "ns3/ipv4-route.h"
++#include "ns3/node.h"
++#include "ns3/socket.h"
++#include "ns3/net-device.h"
++#include "ns3/uinteger.h"
++#include "ns3/trace-source-accessor.h"
++#include "ns3/object-vector.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/boolean.h"
++#include "ns3/ipv4-routing-table-entry.h"
++#include "ns3/tcp-header.h"
++#include "ns3/rl-tag.h"
++
++#include "loopback-net-device.h"
++#include "arp-l3-protocol.h"
++#include "ipv4-l3-protocol.h"
++#include "icmpv4-l4-protocol.h"
++#include "ipv4-interface.h"
++#include "ipv4-raw-socket-impl.h"
++
++NS_LOG_COMPONENT_DEFINE ("StoneACL");
++using namespace std;
++namespace ns3
++{
++NS_OBJECT_ENSURE_REGISTERED (StoneACL);
++
++TypeId StoneACL::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::StoneACL")
++                      .SetParent<Object> ()
++                      .AddConstructor<StoneACL> ()
++                      ;
++  return tid;
++}
++
++StoneACL::StoneACL()
++{
++  
++}
++StoneACL::~StoneACL()
++{
++  
++}
++
++void
++StoneACL::SetNetwork(Ipv4Address address)
++{
++  NS_LOG_FUNCTION (this << address);
++  m_networkIPAddr = address;
++}
++
++void
++StoneACL::SetNode (Ptr<Node> node)
++{
++  NS_LOG_FUNCTION (this << "Node"<< node->GetId());
++  m_node = node;
++}
++
++void
++StoneACL::SetMaxDownlink (int32_t maxDownlink)
++{
++  NS_LOG_FUNCTION (this << maxDownlink);
++  m_maxDownlink = maxDownlink;
++}
++
++void
++StoneACL::ConductTag(Ptr<Packet> packet, Ipv4Header const &ipHeader, int32_t interface)
++{
++  NS_LOG_FUNCTION (packet << interface);
++  NS_LOG_INFO ("Node:" << m_node->GetId() << " Network:" << m_networkIPAddr << " Inf:"<< interface << " MaxDownlink:" << m_maxDownlink);
++  NS_LOG_INFO ("Protocol:" << int32_t(ipHeader.GetProtocol ()));
++  // Stone ACL filter is only for downlinks
++  if ((interface <= m_maxDownlink) && (ipHeader.GetProtocol () == 6))
++  {
++    TcpHeader tcpHeader;
++    packet->PeekHeader (tcpHeader);
++    NS_LOG_INFO(tcpHeader);
++    
++    NS_LOG_INFO(ipHeader.GetSource().CombineMask(Ipv4Mask("255.255.0.0")));
++    if ((!(tcpHeader.GetFlags () & TcpHeader::ACK)) 
++        && (tcpHeader.GetFlags () & TcpHeader::SYN) 
++        && (ipHeader.GetSource().CombineMask(Ipv4Mask("255.255.0.0")) == m_networkIPAddr))
++    {
++      RLTag rlTag;
++      bool exist = packet->PeekPacketTag (rlTag);
++      NS_ASSERT (!exist);
++      rlTag.SetRL (1);
++      packet->AddPacketTag (rlTag);
++      NS_LOG_INFO ("RL marked!");
++    }
++   
++  }
++}
++
++}//namespace ns3
+diff --git a/src/internet/model/stone-acl.h b/src/internet/model/stone-acl.h
+new file mode 100644
+index 0000000..adfb5a8
+--- /dev/null
++++ b/src/internet/model/stone-acl.h
+@@ -0,0 +1,43 @@
++/*
++ * Stone ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef STONE_ACL_H
++#define STONE_ACL_H
++
++#include "ns3/object.h"
++#include <stdint.h>
++#include <string>
++#include "ns3/object-factory.h"
++#include "ns3/address.h"
++#include "ns3/attribute.h"
++#include "ns3/net-device.h"
++#include "ns3/node-container.h"
++#include "ns3/ipv4-header.h"
++
++using namespace std;
++namespace ns3
++{
++
++class StoneACL : public Object
++{
++public:
++  static TypeId GetTypeId(void);
++  
++  StoneACL();
++  virtual ~StoneACL();
++  void SetNetwork(Ipv4Address address);
++  void SetNode (Ptr<Node> node);
++  void SetMaxDownlink (int32_t maxDownlink);
++  void ConductTag(Ptr<Packet> packet, Ipv4Header const &ipHeader, int32_t interface);
++  
++private:
++  Ipv4Address m_networkIPAddr;
++  Ptr<Node> m_node;
++  int32_t m_maxDownlink;
++};
++
++}   //namespace ns3
++
++#endif /* STONE_ACL_H */
+diff --git a/src/internet/model/tcp-socket.cc b/src/internet/model/tcp-socket.cc
+index e230d7c..eb0c09f 100644
+--- a/src/internet/model/tcp-socket.cc
++++ b/src/internet/model/tcp-socket.cc
+@@ -67,7 +67,7 @@ TcpSocket::GetTypeId (void)
+                    MakeUintegerChecker<uint32_t> ())
+     .AddAttribute ("InitialCwnd",
+                    "TCP initial congestion window size (segments)",
+-                   UintegerValue (1),
++                   UintegerValue (10),
+                    MakeUintegerAccessor (&TcpSocket::GetInitialCwnd,
+                                          &TcpSocket::SetInitialCwnd),
+                    MakeUintegerChecker<uint32_t> ())
+diff --git a/src/internet/model/tracc-acl.cc b/src/internet/model/tracc-acl.cc
+new file mode 100644
+index 0000000..f4b96c0
+--- /dev/null
++++ b/src/internet/model/tracc-acl.cc
+@@ -0,0 +1,217 @@
++/*
++ * Tracc ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++
++#include "ns3/tracc-acl.h"
++#include "ns3/log.h"
++#include "ns3/node.h"
++#include "ns3/packet.h"
++#include "ns3/log.h"
++#include "ns3/callback.h"
++#include "ns3/ipv4-address.h"
++#include "ns3/ipv4-route.h"
++#include "ns3/node.h"
++#include "ns3/socket.h"
++#include "ns3/net-device.h"
++#include "ns3/uinteger.h"
++#include "ns3/trace-source-accessor.h"
++#include "ns3/object-vector.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/boolean.h"
++#include "ns3/ipv4-routing-table-entry.h"
++#include "ns3/tcp-header.h"
++#include "ns3/rl-tag.h"
++#include "ns3/li-cx-tag.h"
++#include "ns3/fb-li-tag.h"
++#include "ns3/fb-tag.h"
++#include "ns3/ece-tag.h"
++#include "ns3/double.h"
++
++#include "loopback-net-device.h"
++#include "arp-l3-protocol.h"
++#include "ipv4-l3-protocol.h"
++#include "icmpv4-l4-protocol.h"
++#include "ipv4-interface.h"
++#include "ipv4-raw-socket-impl.h"
++
++NS_LOG_COMPONENT_DEFINE ("TraccACL");
++using namespace std;
++namespace ns3
++{
++NS_OBJECT_ENSURE_REGISTERED (TraccACL);
++
++TypeId TraccACL::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::TraccACL")
++                      .SetParent<Object> ()
++                      .AddConstructor<TraccACL> ()
++                      .AddAttribute ("UseFBForOutFilter",
++                                     "Use FB_Tag to filter outgoing traffic.",
++                                     BooleanValue (false),
++                                     MakeBooleanAccessor (&TraccACL::m_useFBForOutFilter),
++                                     MakeBooleanChecker ())
++                      .AddAttribute ("TimeInterval", "Time interval to update tables.",
++                                     TimeValue (MicroSeconds (200)), // One RTT
++                                     MakeTimeAccessor (&TraccACL::m_timeInterval),
++                                     MakeTimeChecker ())
++                      .AddAttribute ("AlphaWeight",
++                                     "Weight for calculating alpha parameter",
++                                     DoubleValue (1.0 / 16.0), MakeDoubleAccessor (&TraccACL::m_g),
++                                     MakeDoubleChecker<double> (0, 1))
++                      ;
++  return tid;
++}
++
++TraccACL::TraccACL()
++{
++  
++}
++TraccACL::~TraccACL()
++{
++  
++}
++
++void
++TraccACL::MatrixIni()
++{
++  for (int i = 0; i < m_numLeaf; i++)
++  {
++    for (int j = 0; j < m_numSpine; j++)
++    {
++      m_N[i][j] = 0;
++      m_M[i][j] = 0;
++      m_alpha[i][j] = 0.0;
++    }
++  }
++}
++
++void
++TraccACL::Install (Ptr<Node> node, int32_t numLeaf, int32_t numHost, int32_t numSpine)
++{
++  NS_LOG_FUNCTION (node->GetId() << numLeaf << numHost << numSpine);
++  m_node = node;
++  m_numLeaf = numLeaf;
++  m_numHost = numHost;
++  m_numSpine = numSpine;
++  
++  m_N.resize (numLeaf, vector<int32_t>(numSpine));
++  m_M.resize (numLeaf, vector<int32_t>(numSpine));
++  m_alpha.resize (numLeaf, vector<double>(numSpine));
++  
++  MatrixIni();
++}
++
++void
++TraccACL::SetNetwork(Ipv4Address address)
++{
++  NS_LOG_FUNCTION (this << address);
++  m_networkIPAddr = address;
++}
++
++void
++TraccACL::CalculateClean()
++{
++  NS_LOG_FUNCTION (m_node->GetId());
++  NS_LOG_INFO ("Node:" << m_node->GetId() << " Matrix:\n");
++  for (int i = 0; i < m_numLeaf; i++)
++  {
++    if (m_node->GetId() == 256)
++    {
++      NS_LOG_INFO ("N:" << m_N[i][0] << " " << m_N[i][1] << " " << m_N[i][2] << " " << m_N[i][3]);
++      NS_LOG_INFO ("M:" << m_M[i][0] << " " << m_M[i][1] << " " << m_M[i][2] << " " << m_M[i][3]);
++      NS_LOG_INFO ("A:" << m_alpha[i][0] << " " << m_alpha[i][1] << " " << m_alpha[i][2] << " " << m_alpha[i][3]);
++    }
++    for (int j = 0; j < m_numSpine; j++)
++    {
++      if ((m_N[i][j] > 0) || (m_M[i][j] > 0))
++        m_alpha[i][j] = (1 - m_g) * m_alpha[i][j] + m_g * (m_M[i][j] * 1.0 / (m_M[i][j] + m_N[i][j]));
++      else
++        m_alpha[i][j] = (1 - m_g) * m_alpha[i][j];
++      
++      m_N[i][j] = 0;
++      m_M[i][j] = 0;
++    }
++  }
++  
++  Simulator::ScheduleWithContext(m_node->GetId(), m_timeInterval, &TraccACL::CalculateClean, this);
++}
++
++void
++TraccACL::SetTimer ()
++{
++  NS_LOG_FUNCTION(m_node->GetId());
++  Simulator::ScheduleWithContext(m_node->GetId(), Seconds(0.0), &TraccACL::CalculateClean, this);
++}
++
++void
++TraccACL::TagCount(Ptr<Packet> packet, Ipv4Header const &ipHeader, int32_t interface)
++{
++  NS_LOG_FUNCTION (m_node->GetId () << m_networkIPAddr << m_timeInterval);
++  if ((interface <= m_numHost) && (ipHeader.GetSource().CombineMask(Ipv4Mask("255.255.0.0")) != m_networkIPAddr))
++  {
++    FBTag fb;
++    bool fb_exist = packet->PeekPacketTag (fb);
++    if (!fb_exist)
++    {
++      return;
++    }
++    
++    FBLITag fbli;
++    int32_t li;
++    bool fbli_exist = packet->RemovePacketTag (fbli);
++    if (fbli_exist)
++    {
++      li = fbli.GetFBLI ();
++      int32_t src_l = ((ipHeader.GetSource().Get() >> 16 ) & 0xff);
++      NS_LOG_INFO ("Got li:" << (int32_t)li);
++      
++      EceTag ece;
++      bool ece_exist = packet->RemovePacketTag (ece);
++      
++      if (ece_exist)
++        m_M[src_l][li]++; //W/ ECE
++      else
++        m_N[src_l][li]++; ////W/o ECE
++      
++      uint8_t cx = (uint8_t)(m_alpha[src_l][li] * 16);
++      
++      LICXTag licxTag;
++      packet->RemovePacketTag (licxTag);
++
++      licxTag.SetLICX (cx);
++      packet->AddPacketTag (licxTag);
++      NS_LOG_INFO ("Sent licx to sender:" << (uint32_t)cx << " " << m_alpha[src_l][li]<< " " << src_l << " " << li << " "<<ipHeader.GetSource());
++    }
++    
++    return;
++  }
++  
++  if (interface <= m_numHost) //RL traffic
++      return;
++  // ipHeader.GetDestination().CombineMask(Ipv4Mask("0.255.0.0"))
++  //
++  int32_t l = ((ipHeader.GetDestination().Get() >> 16 ) & 0xff);
++  int32_t p = interface - m_numHost - 1;
++  
++  NS_ASSERT (p < m_numSpine);
++  NS_ASSERT (l < m_numLeaf);
++  
++  NS_LOG_FUNCTION ("Filtered!" << l << p);
++  
++  LICXTag licxTag;
++  bool exist = packet->RemovePacketTag (licxTag);
++  if (exist)
++  {
++    NS_LOG_INFO ("LICX Tag already exists!");
++  }
++  licxTag.SetLICX (p + 1);
++  packet->AddPacketTag (licxTag);
++  NS_LOG_INFO ("Sent licx to receiver:" << p + 1);
++  
++}
++
++
++
++}//namespace ns3
+diff --git a/src/internet/model/tracc-acl.h b/src/internet/model/tracc-acl.h
+new file mode 100644
+index 0000000..dc800ec
+--- /dev/null
++++ b/src/internet/model/tracc-acl.h
+@@ -0,0 +1,57 @@
++/*
++ * Tracc ACL implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef TRACC_ACL_H
++#define TRACC_ACL_H
++
++#include "ns3/object.h"
++#include <stdint.h>
++#include <string>
++#include <vector>
++#include "ns3/object-factory.h"
++#include "ns3/address.h"
++#include "ns3/attribute.h"
++#include "ns3/net-device.h"
++#include "ns3/node-container.h"
++#include "ns3/ipv4-header.h"
++#include "ns3/nstime.h"
++
++using namespace std;
++namespace ns3
++{
++
++class TraccACL : public Object
++{
++public:
++  static TypeId GetTypeId(void);
++  
++  TraccACL();
++  virtual ~TraccACL();
++  
++  void Install (Ptr<Node> node, int32_t numLeaf, int32_t numHost, int32_t numSpine);
++  void SetNetwork(Ipv4Address address);
++  void TagCount(Ptr<Packet> packet, Ipv4Header const &ipHeader, int32_t interface);
++  void SetTimer ();
++  void CalculateClean();
++private:
++  void MatrixIni();
++  
++  Ipv4Address m_networkIPAddr;
++  double m_g;
++  Ptr<Node> m_node;
++  int32_t m_numLeaf;
++  int32_t m_numHost;
++  int32_t m_numSpine;
++  vector<vector<int32_t> > m_N; 
++  vector<vector<int32_t> > m_M;
++  vector<vector<double> > m_alpha;
++  
++  bool m_useFBForOutFilter;
++  Time m_timeInterval;
++};
++
++}   //namespace ns3
++
++#endif /* TRACC_ACL_H */
+diff --git a/src/internet/wscript b/src/internet/wscript
+index f1fee5c..2b49de0 100644
+--- a/src/internet/wscript
++++ b/src/internet/wscript
+@@ -198,6 +198,10 @@ def build(bld):
+         'model/mp-tcp-typedefs.cc',
+         'model/tcp-options.cc',
+         'model/mp-tcp-subflow.cc',
++        'model/stone-acl.cc',                           # Enhuan Dong
++        'helper/stone-acl-helper.cc',                   # Enhuan Dong
++        'model/tracc-acl.cc',                           # Enhuan Dong
++        'helper/tracc-acl-helper.cc',                   # Enhuan Dong
+         ]
+ 
+     internet_test = bld.create_ns3_module_test_library('internet')
+@@ -319,6 +323,10 @@ def build(bld):
+         'model/mp-tcp-subflow.h',             # Morteza Kheirkhah
+         'model/mmp-tcp-socket-base.h',        # Morteza Kheirkhah
+         'model/packet-scatter-socket-base.h',
++        'model/stone-acl.h',                  # Enhuan Dong
++        'helper/stone-acl-helper.h',          # Enhuan Dong    
++        'model/tracc-acl.h',                  # Enhuan Dong
++        'helper/tracc-acl-helper.h',          # Enhuan Dong    
+        ]
+ 
+     if bld.env['NSC_ENABLED']:
+diff --git a/src/network/utils/fb-li-tag.cc b/src/network/utils/fb-li-tag.cc
+new file mode 100644
+index 0000000..79a8db4
+--- /dev/null
++++ b/src/network/utils/fb-li-tag.cc
+@@ -0,0 +1,71 @@
++/*
++ * FB_LI tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#include "fb-li-tag.h"
++#include "ns3/log.h"
++
++NS_LOG_COMPONENT_DEFINE ("FBLITag");
++
++namespace ns3 {
++
++NS_OBJECT_ENSURE_REGISTERED (FBLITag);
++
++TypeId 
++FBLITag::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::FBLITag")
++    .SetParent<Tag> ()
++    .AddConstructor<FBLITag> ()
++  ;
++  return tid;
++}
++TypeId 
++FBLITag::GetInstanceTypeId (void) const
++{
++  return GetTypeId ();
++}
++uint32_t 
++FBLITag::GetSerializedSize (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return 1;
++}
++void 
++FBLITag::Serialize (TagBuffer buf) const
++{
++  NS_LOG_FUNCTION (this << &buf);
++  buf.WriteU8 (m_fb_li);
++}
++void 
++FBLITag::Deserialize (TagBuffer buf)
++{
++  NS_LOG_FUNCTION (this << &buf);
++  m_fb_li = buf.ReadU8();
++}
++void 
++FBLITag::Print (std::ostream &os) const
++{
++  NS_LOG_FUNCTION (this << &os);
++  os << "FB LI Tag  = " << (int)m_fb_li;
++}
++FBLITag::FBLITag ()
++  : Tag () 
++{
++  NS_LOG_FUNCTION (this);
++}
++void
++FBLITag::SetFBLI (uint8_t fbli)
++{
++  NS_LOG_FUNCTION (this << fbli);
++  m_fb_li = fbli;
++}
++uint8_t
++FBLITag::GetFBLI (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return m_fb_li;
++}
++
++} // namespace ns3
+diff --git a/src/network/utils/fb-li-tag.h b/src/network/utils/fb-li-tag.h
+new file mode 100644
+index 0000000..3ed4bd0
+--- /dev/null
++++ b/src/network/utils/fb-li-tag.h
+@@ -0,0 +1,33 @@
++/*
++ * FB_LI tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef FB_LI_TAG_H
++#define FB_LI_TAG_H
++
++#include "ns3/tag.h"
++
++namespace ns3 {
++
++class FBLITag : public Tag
++{
++public:
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer buf) const;
++  virtual void Deserialize (TagBuffer buf);
++  virtual void Print (std::ostream &os) const;
++
++  FBLITag ();
++  void SetFBLI (uint8_t ce);
++  uint8_t GetFBLI (void) const;
++
++private:
++  uint8_t m_fb_li;
++};
++
++} // namespace ns3
++
++#endif /* FB_LI_TAG_H */
+diff --git a/src/network/utils/fb-tag.cc b/src/network/utils/fb-tag.cc
+new file mode 100644
+index 0000000..ed0c164
+--- /dev/null
++++ b/src/network/utils/fb-tag.cc
+@@ -0,0 +1,71 @@
++/*
++ * FB tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#include "fb-tag.h"
++#include "ns3/log.h"
++
++NS_LOG_COMPONENT_DEFINE ("FBTag");
++
++namespace ns3 {
++
++NS_OBJECT_ENSURE_REGISTERED (FBTag);
++
++TypeId 
++FBTag::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::FBTag")
++    .SetParent<Tag> ()
++    .AddConstructor<FBTag> ()
++  ;
++  return tid;
++}
++TypeId 
++FBTag::GetInstanceTypeId (void) const
++{
++  return GetTypeId ();
++}
++uint32_t 
++FBTag::GetSerializedSize (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return 1;
++}
++void 
++FBTag::Serialize (TagBuffer buf) const
++{
++  NS_LOG_FUNCTION (this << &buf);
++  buf.WriteU8 (m_fb);
++}
++void 
++FBTag::Deserialize (TagBuffer buf)
++{
++  NS_LOG_FUNCTION (this << &buf);
++  m_fb = buf.ReadU8();
++}
++void 
++FBTag::Print (std::ostream &os) const
++{
++  NS_LOG_FUNCTION (this << &os);
++  os << "FB Tag  = " << (int)m_fb;
++}
++FBTag::FBTag ()
++  : Tag () 
++{
++  NS_LOG_FUNCTION (this);
++}
++void
++FBTag::SetFB (uint8_t fb)
++{
++  NS_LOG_FUNCTION (this << fb);
++  m_fb = fb;
++}
++uint8_t
++FBTag::GetFB (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return m_fb;
++}
++
++} // namespace ns3
+diff --git a/src/network/utils/fb-tag.h b/src/network/utils/fb-tag.h
+new file mode 100644
+index 0000000..4f4744f
+--- /dev/null
++++ b/src/network/utils/fb-tag.h
+@@ -0,0 +1,33 @@
++/*
++ * FB tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef FB_TAG_H
++#define FB_TAG_H
++
++#include "ns3/tag.h"
++
++namespace ns3 {
++
++class FBTag : public Tag
++{
++public:
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer buf) const;
++  virtual void Deserialize (TagBuffer buf);
++  virtual void Print (std::ostream &os) const;
++
++  FBTag ();
++  void SetFB (uint8_t fb);
++  uint8_t GetFB (void) const;
++
++private:
++  uint8_t m_fb;
++};
++
++} // namespace ns3
++
++#endif /* FB_LI_TAG_H */
+diff --git a/src/network/utils/li-cx-tag.cc b/src/network/utils/li-cx-tag.cc
+new file mode 100644
+index 0000000..3744e99
+--- /dev/null
++++ b/src/network/utils/li-cx-tag.cc
+@@ -0,0 +1,71 @@
++/*
++ * LI-CX tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#include "li-cx-tag.h"
++#include "ns3/log.h"
++
++NS_LOG_COMPONENT_DEFINE ("LICXTag");
++
++namespace ns3 {
++
++NS_OBJECT_ENSURE_REGISTERED (LICXTag);
++
++TypeId 
++LICXTag::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::LICXTag")
++    .SetParent<Tag> ()
++    .AddConstructor<LICXTag> ()
++  ;
++  return tid;
++}
++TypeId 
++LICXTag::GetInstanceTypeId (void) const
++{
++  return GetTypeId ();
++}
++uint32_t 
++LICXTag::GetSerializedSize (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return 1;
++}
++void 
++LICXTag::Serialize (TagBuffer buf) const
++{
++  NS_LOG_FUNCTION (this << &buf);
++  buf.WriteU8 (m_li_cx);
++}
++void 
++LICXTag::Deserialize (TagBuffer buf)
++{
++  NS_LOG_FUNCTION (this << &buf);
++  m_li_cx = buf.ReadU8();
++}
++void 
++LICXTag::Print (std::ostream &os) const
++{
++  NS_LOG_FUNCTION (this << &os);
++  os << "LI CX Tag  = " << (int)m_li_cx;
++}
++LICXTag::LICXTag ()
++  : Tag () 
++{
++  NS_LOG_FUNCTION (this);
++}
++void
++LICXTag::SetLICX (uint8_t licx)
++{
++  NS_LOG_FUNCTION (this << licx);
++  m_li_cx = licx;
++}
++uint8_t
++LICXTag::GetLICX (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return m_li_cx;
++}
++
++} // namespace ns3
+diff --git a/src/network/utils/li-cx-tag.h b/src/network/utils/li-cx-tag.h
+new file mode 100644
+index 0000000..2c2d1aa
+--- /dev/null
++++ b/src/network/utils/li-cx-tag.h
+@@ -0,0 +1,33 @@
++/*
++ * LI_CX tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef LI_CX_TAG_H
++#define LI_CX_TAG_H
++
++#include "ns3/tag.h"
++
++namespace ns3 {
++
++class LICXTag : public Tag
++{
++public:
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer buf) const;
++  virtual void Deserialize (TagBuffer buf);
++  virtual void Print (std::ostream &os) const;
++
++  LICXTag ();
++  void SetLICX (uint8_t ce);
++  uint8_t GetLICX (void) const;
++
++private:
++  uint8_t m_li_cx;
++};
++
++} // namespace ns3
++
++#endif /* LI_CX_TAG_H */
+diff --git a/src/network/utils/red-queue.cc b/src/network/utils/red-queue.cc
+index bb54565..93dca81 100644
+--- a/src/network/utils/red-queue.cc
++++ b/src/network/utils/red-queue.cc
+@@ -324,6 +324,8 @@ RedQueue::DoEnqueue (Ptr<Packet> p)
+   // Extract ECT bit
+   EctTag ectTag;
+   bool isEct =  p->PeekPacketTag(ectTag);
++  if (!isEct)
++    NS_LOG_UNCOND ("\t No ECT");
+ 	// Try to mark ECN bits first
+   if (dropType == DTYPE_UNFORCED_SOFT || dropType == DTYPE_UNFORCED_HARD)
+     {
+@@ -338,6 +340,7 @@ RedQueue::DoEnqueue (Ptr<Packet> p)
+             }
+           m_stats.marked++;
+           dropType = DTYPE_NONE; // We marked ECN bits! Packet shouldn't be dropped
++          NS_LOG_UNCOND ("\t ECN marked");
+         }
+       else if (m_useCurrent && isControlPkt)
+         { // Control packets
+diff --git a/src/network/utils/rl-tag.cc b/src/network/utils/rl-tag.cc
+new file mode 100644
+index 0000000..03ab686
+--- /dev/null
++++ b/src/network/utils/rl-tag.cc
+@@ -0,0 +1,71 @@
++/*
++ * RL tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#include "rl-tag.h"
++#include "ns3/log.h"
++
++NS_LOG_COMPONENT_DEFINE ("RLTag");
++
++namespace ns3 {
++
++NS_OBJECT_ENSURE_REGISTERED (RLTag);
++
++TypeId 
++RLTag::GetTypeId (void)
++{
++  static TypeId tid = TypeId ("ns3::RLTag")
++    .SetParent<Tag> ()
++    .AddConstructor<RLTag> ()
++  ;
++  return tid;
++}
++TypeId 
++RLTag::GetInstanceTypeId (void) const
++{
++  return GetTypeId ();
++}
++uint32_t 
++RLTag::GetSerializedSize (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return 1;
++}
++void 
++RLTag::Serialize (TagBuffer buf) const
++{
++  NS_LOG_FUNCTION (this << &buf);
++  buf.WriteU8 (m_rl);
++}
++void 
++RLTag::Deserialize (TagBuffer buf)
++{
++  NS_LOG_FUNCTION (this << &buf);
++  m_rl = buf.ReadU8();
++}
++void 
++RLTag::Print (std::ostream &os) const
++{
++  NS_LOG_FUNCTION (this << &os);
++  os << "RL Tag  = " << (int)m_rl;
++}
++RLTag::RLTag ()
++  : Tag () 
++{
++  NS_LOG_FUNCTION (this);
++}
++void
++RLTag::SetRL (uint8_t rl)
++{
++  NS_LOG_FUNCTION (this << rl);
++  m_rl = rl;
++}
++uint8_t
++RLTag::GetRL (void) const
++{
++  NS_LOG_FUNCTION (this);
++  return m_rl;
++}
++
++} // namespace ns3
+diff --git a/src/network/utils/rl-tag.h b/src/network/utils/rl-tag.h
+new file mode 100644
+index 0000000..e5c9be8
+--- /dev/null
++++ b/src/network/utils/rl-tag.h
+@@ -0,0 +1,33 @@
++/*
++ * RL tag implementation.
++ * Enhuan Dong
++ * Email: deh13@mails.tsinghua.edu.cn
++ */
++#ifndef RL_TAG_H
++#define RL_TAG_H
++
++#include "ns3/tag.h"
++
++namespace ns3 {
++
++class RLTag : public Tag
++{
++public:
++  static TypeId GetTypeId (void);
++  virtual TypeId GetInstanceTypeId (void) const;
++  virtual uint32_t GetSerializedSize (void) const;
++  virtual void Serialize (TagBuffer buf) const;
++  virtual void Deserialize (TagBuffer buf);
++  virtual void Print (std::ostream &os) const;
++
++  RLTag ();
++  void SetRL (uint8_t ce);
++  uint8_t GetRL (void) const;
++
++private:
++  uint8_t m_rl;
++};
++
++} // namespace ns3
++
++#endif /* RL_TAG_H */
+diff --git a/src/network/wscript b/src/network/wscript
+index 0907bd5..a5a77e2 100644
+--- a/src/network/wscript
++++ b/src/network/wscript
+@@ -66,6 +66,10 @@ def build(bld):
+         'helper/packet-socket-helper.cc',
+         'helper/trace-helper.cc',
+         'helper/delay-jitter-estimation.cc',
++        'utils/rl-tag.cc',
++        'utils/li-cx-tag.cc',
++        'utils/fb-li-tag.cc',
++        'utils/fb-tag.cc',
+         ]
+ 
+     network_test = bld.create_ns3_module_test_library('network')
+@@ -153,6 +157,10 @@ def build(bld):
+         'helper/packet-socket-helper.h',
+         'helper/trace-helper.h',
+         'helper/delay-jitter-estimation.h',
++        'utils/rl-tag.h',
++        'utils/li-cx-tag.h',
++        'utils/fb-li-tag.h',
++        'utils/fb-tag.h',
+         ]
+ 
+     if (bld.env['ENABLE_EXAMPLES']):
+diff --git a/src/point-to-point/helper/point-to-point-helper.cc b/src/point-to-point/helper/point-to-point-helper.cc
+index 1bd25cc..7a39705 100644
+--- a/src/point-to-point/helper/point-to-point-helper.cc
++++ b/src/point-to-point/helper/point-to-point-helper.cc
+@@ -51,13 +51,15 @@ PointToPointHelper::SetQueue (std::string type,
+                               std::string n1, const AttributeValue &v1,
+                               std::string n2, const AttributeValue &v2,
+                               std::string n3, const AttributeValue &v3,
+-                              std::string n4, const AttributeValue &v4)
++                              std::string n4, const AttributeValue &v4,
++                              std::string n5, const AttributeValue &v5)
+ {
+   m_queueFactory.SetTypeId (type);
+   m_queueFactory.Set (n1, v1);
+   m_queueFactory.Set (n2, v2);
+   m_queueFactory.Set (n3, v3);
+   m_queueFactory.Set (n4, v4);
++  m_queueFactory.Set (n5, v5);
+ }
+ 
+ void 
+diff --git a/src/point-to-point/helper/point-to-point-helper.h b/src/point-to-point/helper/point-to-point-helper.h
+index 55dea00..be1a064 100644
+--- a/src/point-to-point/helper/point-to-point-helper.h
++++ b/src/point-to-point/helper/point-to-point-helper.h
+@@ -74,7 +74,8 @@ public:
+                  std::string n1 = "", const AttributeValue &v1 = EmptyAttributeValue (),
+                  std::string n2 = "", const AttributeValue &v2 = EmptyAttributeValue (),
+                  std::string n3 = "", const AttributeValue &v3 = EmptyAttributeValue (),
+-                 std::string n4 = "", const AttributeValue &v4 = EmptyAttributeValue ());
++                 std::string n4 = "", const AttributeValue &v4 = EmptyAttributeValue (),
++                 std::string n5 = "", const AttributeValue &v5 = EmptyAttributeValue ());
+ 
+   /**
+    * Set an attribute value to be propagated to each NetDevice created by the
